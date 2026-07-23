@@ -1,4 +1,5 @@
 # Secrets — NEVER commit
+.claude/
 .env
 *.token
 tokens.json

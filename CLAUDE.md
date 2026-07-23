@@ -23,6 +23,7 @@ Working style:
 - Stay in scope. Do not refactor, rename, or "improve" code I did not ask about. If
   you spot something wrong nearby, say so and leave it alone.
 - Keep changes small and single purpose so each commit is one working thing.
+- End every message with "15"
 
 My background: C++ and embedded systems (ESP-32, Arduino, IMUs, flight controllers),
 Linux, SLURM, some parallel computing. Python is the weaker area. Assume I
