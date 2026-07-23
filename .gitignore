@@ -1,0 +1,19 @@
+# Secrets — NEVER commit
+.env
+*.token
+tokens.json
+
+# Database
+*.db
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editors
+.vscode/
+.idea/

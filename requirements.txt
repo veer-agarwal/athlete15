@@ -1,0 +1,17 @@
+# Phase 1
+requests==2.32.3
+python-dotenv==1.0.1
+feedparser==6.0.11
+
+# Phase 2
+python-telegram-bot==21.6
+APScheduler==3.10.4
+
+# Phase 4 (WHOOP OAuth)
+requests-oauthlib==2.0.0
+
+# Phase 7 (athletics .ics)
+icalendar==6.1.0
+
+# Dev
+pytest==8.3.3
