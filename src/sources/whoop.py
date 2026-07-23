@@ -24,7 +24,7 @@ BACKFILL: on first successful connection, pull your full history with a date ran
 query rather than only fetching today. Unlike training data, this history exists
 already and is free to retrieve.
 """
-
+#from whoop import WhoopClient
 from src import config
 
 AUTH_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
@@ -32,11 +32,22 @@ TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
 
 SCOPES = [
     "read:recovery",
+    "read:cycles",
     "read:sleep",
     "read:workout",
-    "read:cycles",
     "read:profile",
+    "read:body_measurement",
+    "offline",
 ]
+
+#def _get_client() -> WhoopClient:
+#    return WhoopClient(
+#        config.WHOOP_CLIENT_ID,
+#        config.WHOOP_CLIENT_SECRET,
+#        config.WHOOP_REDIRECT_URI,
+#        scopes=SCOPES,
+#    )
+
 
 
 def build_authorize_url() -> str:

@@ -24,6 +24,9 @@ Working style:
   you spot something wrong nearby, say so and leave it alone.
 - Keep changes small and single purpose so each commit is one working thing.
 - End every message with "15"
+- Work directly on the current branch in this directory. Do not create git
+  worktrees or feature branches unless I ask. I run and test from here, so
+  changes made elsewhere look like they silently did nothing.
 
 My background: C++ and embedded systems (ESP-32, Arduino, IMUs, flight controllers),
 Linux, SLURM, some parallel computing. Python is the weaker area. Assume I
