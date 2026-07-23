@@ -8,41 +8,36 @@ Project context for Claude Code. Read at the start of every session.
 
 ## How to work with me
 
-I am Veer Agarwal, an ECE student at NYU Tandon. I am learning Python while building
-this, and that goal carries equal weight to shipping the product.
+I am Veer Agarwal, an ECE student at NYU Tandon.
 
 Working style:
 
 - Be concise and direct. No filler openings.
 - No em dashes in anything written for me. Plain ASCII over decorative Unicode.
-- Explain your approach before writing code, then write it. Do not lead with a wall
-  of code.
-- One function at a time. Do not generate whole files unprompted.
-- When a concept is teachable, ask me to try first. Especially loops, comprehensions,
-  error handling, decorators, async, and context managers. Give me the signature and
-  docstring and let me attempt the body.
-- Explain why, not just what. "A session object reuses the TCP connection across
-  requests" is useful. "Added a session" is not.
-- Give me something to react to rather than asking a lot of clarifying questions
-  upfront. I will edit and send back revisions.
+- Implement what I ask. Do not quiz me, do not ask me to write it myself, do not
+  withhold code to make a teaching point. I get conceptual explanation elsewhere.
+- Do explain non-obvious decisions in a sentence or two after the fact, and comment
+  the code where the reasoning is not visible from reading it. Timezone handling,
+  OAuth refresh, retry logic, and anything with a silent failure mode.
 - Push back when something is a bad idea. Lay out the tradeoffs.
-- Do not silently fix my code. Tell me what is wrong and let me fix it.
-
-If I say "just write it," override the above for that task.
+- Stay in scope. Do not refactor, rename, or "improve" code I did not ask about. If
+  you spot something wrong nearby, say so and leave it alone.
+- Keep changes small and single purpose so each commit is one working thing.
 
 My background: C++ and embedded systems (ESP-32, Arduino, IMUs, flight controllers),
-Linux, SLURM, some parallel computing. Python is the weaker area and the reason for
-this project. Assume I understand pointers, memory, and control flow. Do not assume
-I know Python idioms, packaging, or virtual environments.
+Linux, SLURM, some parallel computing. Python is the weaker area. Assume I
+understand pointers, memory, control flow, and general programming. Do not assume I
+know Python idioms, packaging, or virtual environments, and name them when you use
+them so I can look them up.
 
 ---
 
 ## What this is
 
-athlete15 is a self-hosted personal assistant. Pulls data from several sources, stores it in local
-SQLite, and sends a briefing to Telegram around 6:30 AM daily. Accepts commands back
-over Telegram to log training and injuries, and eventually to write to Notion and my
-calendar.
+athlete15 is a self-hosted personal assistant. Pulls data from several sources,
+stores it in local SQLite, and sends a briefing to Telegram around 6:30 AM daily.
+Accepts commands back over Telegram to log training and injuries, and eventually to
+write to Notion and my calendar.
 
 Everything runs locally. No cloud LLM inference. Telegram is the only third party in
 the loop and it only ever sees finished messages.
@@ -55,7 +50,7 @@ the loop and it only ever sees finished messages.
 - Summer: solo structured programming at a sports performance facility.
 - Fall: tri-weekly lifts, captain's practices, open gyms.
 - Winter and spring: competitive season, matches, travel.
-- Home is Westfield NJ, school is Brooklyn NY.
+- Home is Westfield NJ, school is Lower East Side / Brooklyn NY.
 
 Implication: the NYU team athletics .ics feed has no useful data until roughly
 December. Do not prioritize it. Facility training, injuries, and offseason work are
@@ -173,12 +168,12 @@ BACKUP_DIR on the 7 TB drive. Build that in phase 3, not later.
 
 ## Current phase
 
-Phase 1: weather and news to console. No database, no Telegram, no LLM.
+Phase 2: Telegram delivery. Weather and news sources are done and working.
 
 ```
-1  Weather + news to console
-2  Telegram delivery
-3  SQLite
+1  Weather + news to console            DONE
+2  Telegram delivery                    current
+3  SQLite + backup to archive drive
 4  Training + injury logging
 5  WHOOP (backfill history on first connect)
 6  Notion coursework

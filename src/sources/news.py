@@ -1,13 +1,11 @@
-"""News headlines via RSS and Atom.
+"""News headlines via RSS. Phase 1. DONE.
 
-Fetching is done with requests rather than by handing feedparser a URL, because
-feedparser.parse() does its own HTTP through urllib and exposes no timeout. This
-process is single threaded and the morning job runs unattended, so a feed server
-that accepts the connection and then stalls would hang the whole briefing.
-Fetching separately also gives us raise_for_status() and the raw response body.
+Returns list[dict] with keys: title, link, source, published.
+Capped at config.NEWS_MAX_ITEMS across all feeds in config.NEWS_FEEDS.
 
-feedparser is still what parses the bytes. It normalises RSS and Atom into one
-shape, so nothing below has to care which format a given site publishes.
+feedparser does not raise on a dead or malformed feed. It sets parsed.bozo and
+returns zero entries, which means a broken feed looks like success. This runs
+unattended at 6:30 AM, so that failure must be surfaced, not swallowed.
 """
 
 import calendar
@@ -143,5 +141,6 @@ def _interleave(per_feed: list[list[dict]]) -> list[dict]:
 
 
 if __name__ == "__main__":
-    for item in fetch():
-        print(item)
+    # Run this module alone:  python -m src.sources.news
+    for line in format_lines(fetch()):
+        print(line)
