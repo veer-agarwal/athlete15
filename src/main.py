@@ -9,21 +9,32 @@ and sends it to Telegram. The bot polling loop lands in phase 4.
 
 import argparse
 import logging
+import socket
 import sys
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+import requests
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from src import brief, config, db, notify
 from src.sources import whoop
 
-# The machine wakes from S3 sleep to run this and the scheduled task fires on
-# resume, often before the wireless adapter has associated and DNS is answering.
-# A fixed sleep is cruder than polling for connectivity but has no failure mode
-# of its own, and the briefing has no deadline finer than "sometime around 7".
-WAKE_DELAY_SECONDS = 30
+# Hosts the briefing depends on. The wake probe waits until these answer before
+# building, rather than sleeping a fixed interval and hoping the adapter is up.
+PROBE_HOSTS = ("api.prod.whoop.com", "api.notion.com", "caldav.icloud.com")
+NETWORK_PROBE_CAP_SECONDS = 180      # proceed anyway after this, partial beats nothing
+NETWORK_PROBE_INTERVAL_SECONDS = 5   # recheck cadence while waiting
+NETWORK_PROBE_TIMEOUT_SECONDS = 5    # per-host DNS+HEAD attempt
+
+# Wake-triggered briefing (--wait-for-wake): poll WHOOP until last night's sleep
+# cycle closes, then deliver. These bound that loop.
+CUTOFF_HOUR = 11                     # local hour to give up waiting and send what we have
+POLL_INTERVAL_SECONDS = 15 * 60      # gap between WHOOP checks while waiting
+# A nap can close and score a short cycle. Counting it as the night's sleep would
+# fire the briefing hours early on a 40-minute "night", so require real sleep.
+NAP_MIN_SLEEP_HOURS = 3.0
 
 
 def _configure_logging() -> None:
@@ -40,7 +51,7 @@ def _configure_logging() -> None:
     )
 
 
-def send_brief() -> tuple[str, str | None]:
+def send_brief(note: str | None = None) -> tuple[str, str | None]:
     """Build the briefing and send it. This is the scheduled job.
 
     brief.build() degrades per source internally, so it does not raise for a dead
@@ -48,11 +59,17 @@ def send_brief() -> tuple[str, str | None]:
     a job would otherwise be swallowed by APScheduler's default logging. Log it
     here so a failed 7:00 AM send leaves a visible trace instead of nothing.
 
+    A note, when given, is prepended as its own line: the wake job uses it to say
+    "no completed sleep cycle by 11:00" so a recovery-less briefing does not read
+    as if the strap simply had nothing.
+
     Returns the briefing text and the UTC timestamp it was sent at, or None for
     that timestamp if delivery failed. The text is worth storing either way.
     """
     logging.info("briefing run started")
     text = brief.build()
+    if note:
+        text = f"{note}\n\n{text}"
     try:
         notify.send(text)
         sent_at = datetime.now(timezone.utc).isoformat()
@@ -61,6 +78,191 @@ def send_brief() -> tuple[str, str | None]:
     except Exception:
         logging.exception("briefing send failed")
         return text, None
+
+
+def _deliver(note: str | None = None) -> None:
+    """Build, send, record, and back up. Shared by --now and --wait-for-wake.
+
+    Recording uses the local date the briefing is FOR, so a same-morning re-run
+    updates that day's row rather than adding a second. Backup runs last and a
+    disconnected archive drive never turns a delivered briefing into a failed run.
+    """
+    text, sent_at = send_brief(note=note)
+
+    # Local date, not UTC: this is the briefing for this morning, and after 8 PM
+    # Eastern a UTC date would file it under the next day.
+    today = datetime.now(ZoneInfo(config.TIMEZONE)).strftime("%Y-%m-%d")
+    db.record_brief(today, text, sent_at)
+    logging.info("brief recorded for %s (sent_at=%s)", today, sent_at)
+
+    try:
+        db.backup()
+    except Exception:
+        logging.exception("backup failed")
+
+
+def _host_reachable(host: str) -> bool:
+    """DNS resolves AND an HTTPS HEAD gets any response back.
+
+    Any HTTP status counts as reachable: a 401 or 405 from a HEAD still proves
+    the connection is up, which is all the probe is checking. Only a DNS failure
+    or a connection/timeout error means not-yet-connected.
+    """
+    try:
+        socket.getaddrinfo(host, 443)
+    except OSError:
+        return False
+    try:
+        requests.head(f"https://{host}", timeout=NETWORK_PROBE_TIMEOUT_SECONDS)
+    except requests.RequestException:
+        return False
+    return True
+
+
+def _wait_for_network() -> float:
+    """Probe every host until all reachable or the cap. Returns seconds waited.
+
+    Replaces the old fixed 30s post-wake sleep. The wireless adapter is often not
+    associated the instant the machine resumes from S3, and a flat sleep is either
+    wasteful or too short. Proceeds anyway after the cap so a partial briefing
+    still arrives rather than nothing.
+    """
+    start = time.monotonic()
+    while True:
+        unreachable = [host for host in PROBE_HOSTS if not _host_reachable(host)]
+        elapsed = time.monotonic() - start
+
+        if not unreachable:
+            logging.info("network up after %.0fs, all probe hosts reachable", elapsed)
+            return elapsed
+        if elapsed >= NETWORK_PROBE_CAP_SECONDS:
+            logging.warning(
+                "network probe cap %ds reached, still unreachable: %s. proceeding anyway",
+                NETWORK_PROBE_CAP_SECONDS, ", ".join(unreachable),
+            )
+            return elapsed
+
+        logging.info("waiting for network, unreachable: %s", ", ".join(unreachable))
+        time.sleep(NETWORK_PROBE_INTERVAL_SECONDS)
+
+
+def _is_main_sleep(metrics: dict) -> bool:
+    """Whether a fetched WHOOP day is last night's main sleep, not a nap."""
+    hours = metrics.get("sleep_hours")
+    return hours is not None and hours > NAP_MIN_SLEEP_HOURS
+
+
+def wait_for_wake() -> None:
+    """Poll WHOOP after an S3 wake until the sleep cycle closes, then deliver.
+
+    Idempotent: if a briefing is already recorded for today, exits without
+    sending a second one. Distinguishes "no completed cycle yet" (retry) from
+    "WHOOP request failed" (network) from "WHOOP auth failed" (fatal, stop
+    polling) so a slow strap sync is never misread as an outage. At the 11:00
+    local cutoff it sends whatever the other sources have, with a note that no
+    completed cycle was found.
+    """
+    tz = ZoneInfo(config.TIMEZONE)
+    today = datetime.now(tz).strftime("%Y-%m-%d")
+
+    if db.brief_exists(today):
+        logging.info("brief already recorded for %s, exiting (idempotent)", today)
+        return
+
+    _wait_for_network()
+
+    cutoff = datetime.now(tz).replace(
+        hour=CUTOFF_HOUR, minute=0, second=0, microsecond=0
+    )
+
+    while True:
+        # Re-checked every iteration, not just at entry: if the fixed 7:00 --now
+        # job (or a manual run) delivered while this loop was in its 15-minute
+        # sleep, that morning is already done and a second Telegram message would
+        # be a duplicate. record_brief upserts on date, so the DB stays single-row
+        # regardless; this guards the phone.
+        if db.brief_exists(today):
+            logging.info("brief for %s already recorded elsewhere, exiting", today)
+            return
+
+        try:
+            items = whoop.fetch()
+        except whoop.WhoopAuthError:
+            # The stored token is dead; WHOOP cannot succeed this run no matter how
+            # long we wait. whoop.fetch already logged the --auth remediation line.
+            logging.error("WHOOP auth failed during wake wait, delivering without recovery")
+            _deliver(note="WHOOP auth failed, recovery unavailable. Run: python -m src.main --auth")
+            return
+        except requests.RequestException as exc:
+            # A network fault, NOT "no cycle yet". Logged distinctly because
+            # conflating the two is what turned a real auth outage into a
+            # misdiagnosed timing problem before.
+            logging.warning("WHOOP request failed (will retry): %s", exc)
+        else:
+            if items and _is_main_sleep(items[0]):
+                logging.info("completed main-sleep cycle found, delivering briefing")
+                _deliver()
+                return
+            logging.info("whoop: no completed main-sleep cycle yet")
+
+        if datetime.now(tz) >= cutoff:
+            logging.info(
+                "reached %02d:00 cutoff with no completed cycle, sending what is available",
+                CUTOFF_HOUR,
+            )
+            _deliver(
+                note=f"No completed sleep cycle found by {CUTOFF_HOUR}:00, sending without recovery."
+            )
+            return
+
+        # Sleep until the next check, but never past the cutoff.
+        remaining = (cutoff - datetime.now(tz)).total_seconds()
+        nap = min(POLL_INTERVAL_SECONDS, max(0.0, remaining))
+        logging.info("sleeping %.0f min before next WHOOP check", nap / 60)
+        time.sleep(nap)
+
+
+def whoop_audit() -> int:
+    """Print a 7-day WHOOP cycle/workout audit for diffing against the app.
+
+    Read-only. Shows each cycle's local start and end, day strain, recovery, and
+    sleep next to the local date the code assigned it, plus the workouts bucketed
+    onto that date, so date bucketing can be verified by eye against the app.
+    """
+    try:
+        rows = whoop.audit(days=7)
+    except Exception as exc:
+        print(f"WHOOP audit failed: {exc}")
+        return 1
+
+    if not rows:
+        print("no WHOOP cycles in the last 7 days")
+        return 0
+
+    def num(value: float | int | None, spec: str) -> str:
+        return format(value, spec) if value is not None else "-"
+
+    print("WHOOP audit, last 7 days (local time). Diff against the WHOOP app.\n")
+    for row in rows:
+        print(f"{row['date']}  cycle {row['cycle_id']}")
+        print(f"    start {row['start_local']}    end {row['end_local']}")
+        print(
+            f"    strain {num(row['strain'], '.1f')}"
+            f"    recovery {num(row['recovery_score'], '.0f')}"
+            f"    sleep {num(row['sleep_hours'], '.1f')}h"
+            f"    sleep perf {num(row['sleep_performance'], '.0f')}%"
+        )
+        if row["workouts"]:
+            for workout in row["workouts"]:
+                dur = f"{workout['duration_min']}min" if workout["duration_min"] is not None else "-"
+                print(
+                    f"      {workout['sport']:<16}{dur:>8}    "
+                    f"strain {num(workout['strain'], '.1f')}"
+                )
+        else:
+            print("      (no workouts)")
+        print()
+    return 0
 
 
 def authorize_whoop() -> int:
@@ -108,6 +310,16 @@ def main() -> None:
         action="store_true",
         help="start Telegram polling for log entries and block",
     )
+    parser.add_argument(
+        "--wait-for-wake",
+        action="store_true",
+        help="poll WHOOP until the sleep cycle closes, then deliver (11:00 cutoff)",
+    )
+    parser.add_argument(
+        "--whoop-audit",
+        action="store_true",
+        help="print a 7-day WHOOP cycle/workout table for date-bucketing checks",
+    )
     args = parser.parse_args()
 
     _configure_logging()
@@ -116,6 +328,11 @@ def main() -> None:
     # database messages would only interleave with the paste prompt.
     if args.auth:
         raise SystemExit(authorize_whoop())
+
+    # Read-only diagnostic, no database needed. Kept before init_db so its table
+    # is not buried under startup log lines.
+    if args.whoop_audit:
+        raise SystemExit(whoop_audit())
 
     db.init_db()
     logging.info("database ready at %s", config.DB_PATH)
@@ -129,26 +346,16 @@ def main() -> None:
         notify.run_bot()
         return
 
+    if args.wait_for_wake:
+        logging.info("wake-triggered run (--wait-for-wake)")
+        wait_for_wake()
+        return
+
     if args.now:
         logging.info("manual run (--now)")
-        logging.info("waiting %ds for the network to come up", WAKE_DELAY_SECONDS)
-        time.sleep(WAKE_DELAY_SECONDS)
-
-        text, sent_at = send_brief()
-
-        # Local date, not UTC: this is the briefing *for* Thursday morning, and
-        # after 8 PM Eastern a UTC date would file it under the next day.
-        today = datetime.now(ZoneInfo(config.TIMEZONE)).strftime("%Y-%m-%d")
-        db.record_brief(today, text, sent_at)
-        logging.info("brief recorded for %s (sent_at=%s)", today, sent_at)
-
-        # Backup last, and never let a disconnected archive drive turn a delivered
-        # briefing into a failed run.
-        try:
-            db.backup()
-        except Exception:
-            logging.exception("backup failed")
-
+        # Was a fixed 30s sleep; now waits on real connectivity after S3 wake.
+        _wait_for_network()
+        _deliver()
         return
 
     scheduler = BlockingScheduler(timezone=config.TIMEZONE)
