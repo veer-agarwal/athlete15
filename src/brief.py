@@ -18,13 +18,13 @@ The briefing REPORTS. It does not coach. No training recommendations.
 import logging
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import requests
 
 from src import config, db
-from src.sources import weather, news, whoop
+from src.sources import weather, news, notion, whoop
 
 # Retry policy for source fetches. The failure being handled is a network adapter
 # that has not associated yet after an S3 wake, so backoff is fixed rather than
@@ -47,6 +47,13 @@ def build() -> str:
 
     lines.append("Recovery")
     lines.extend(_whoop_lines())
+    lines.append("")
+
+    # Position 4 in the target output, after calendar and before training.
+    # Calendar and training sections do not exist in the briefing yet, so today
+    # it sits directly after recovery; when those arrive they go around it.
+    lines.append("Coursework")
+    lines.extend(_coursework_lines())
     lines.append("")
 
     lines.append("Weather")
@@ -131,6 +138,75 @@ def _whoop_lines() -> list[str]:
     except Exception:
         logging.exception("storing whoop metrics failed, briefing continues")
 
+    return lines
+
+
+# Cap on coursework lines so the section cannot eat the message. Six covers a
+# heavy week; past that the count line says what was cut.
+MAX_COURSEWORK_ITEMS = 6
+
+
+def _coursework_lines() -> list[str]:
+    """Coursework section body, or a single unavailable line.
+
+    Called without _fetch_with_retry, alone among the sections: notion._api
+    already retries internally, because only it can see the Retry-After header a
+    429 carries. Stacking the generic retry on top would make nine attempts and
+    add ninety silent seconds to a morning where Notion is actually down.
+    """
+    try:
+        items = notion.fetch()
+    except Exception as exc:
+        logging.warning("coursework section unavailable: %s", exc)
+        return [f"Notion unavailable ({exc})"]
+
+    lines = _format_coursework(items)
+
+    # Same pattern as the WHOOP section: persist after formatting, and never let
+    # a database problem cost the message the numbers it already has.
+    try:
+        for item in items:
+            db.upsert_task(item)
+        logging.info("stored %d notion task(s)", len(items))
+    except Exception:
+        logging.exception("storing notion tasks failed, briefing continues")
+
+    return lines
+
+
+def _format_coursework(items: list[dict]) -> list[str]:
+    """Render tasks as lines: overdue flagged first, then dated, then undated.
+
+    fetch() already sorts due date ascending with undated last, which puts
+    overdue at the top for free. This function only labels and caps.
+    """
+    if not items:
+        return ["nothing due in the next 14 days"]
+
+    today = datetime.now(ZoneInfo(config.TIMEZONE)).date()
+    lines = []
+    for item in items[:MAX_COURSEWORK_ITEMS]:
+        due = item["due_date"]
+        if due is None:
+            label = "no date"
+        else:
+            due_day = date.fromisoformat(due[:10])
+            if due_day < today:
+                # The flag word carries the urgency; position alone is not
+                # enough on a phone where every line looks the same.
+                label = f"OVERDUE {due_day.strftime('%b %d')}"
+            elif due_day == today:
+                label = "today"
+            else:
+                label = due_day.strftime("%a %b %d")
+
+        detail = ", ".join(part for part in (item["course"], item["type"]) if part)
+        suffix = f" ({detail})" if detail else ""
+        lines.append(f"{label}: {item['title'] or '(untitled)'}{suffix}")
+
+    omitted = len(items) - MAX_COURSEWORK_ITEMS
+    if omitted > 0:
+        lines.append(f"+{omitted} more not shown")
     return lines
 
 

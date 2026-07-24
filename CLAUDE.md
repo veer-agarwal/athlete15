@@ -230,6 +230,42 @@ verdict.
 
 ---
 
+## Notion
+
+The coursework database is named Coursework, created by scripts/create_notion_db.py.
+Its id is NOTION_TASKS_DB_ID in .env. Actual property names and types, exactly as
+they exist (filters are case sensitive about names):
+
+```
+Name     title
+Course   select    ECE-UY 2004, ECE-UY 2233, MA-UY 2034, PH-UY 2033, EXPOS-UA 1
+Due      date
+Status   status    Not started, In progress, Done   (Notion's default options)
+Type     select    pset, exam, lab, reading, project, quiz
+```
+
+Course options grow in the Notion UI as courses change; nothing in code hardcodes
+the list.
+
+API facts that cost time to rediscover:
+
+- src/sources/notion.py pins Notion-Version 2026-03-11. Since version 2025-09-03
+  a database is a container holding data sources, and queries go to
+  /data_sources/:id/query, not /databases/:id/query. NOTION_TASKS_DB_ID is the
+  DATABASE id (what the URL shows); the data source id is resolved from it at
+  runtime and cached.
+- A 404 from Notion nearly always means the database is not shared with the
+  integration (page ... menu -> Connections), not a wrong id. The API refuses to
+  distinguish the two on purpose.
+- Status properties are creatable via the API since March 2026. Custom status
+  option names each need a group (To-do / In progress / Complete); groups
+  themselves are still UI only.
+- fetch() filters out Done tasks, so the local tasks table keeps the last
+  pre-Done state of a finished task. It is a cache of what the briefing saw, not
+  a mirror of the database.
+- Notion 429s carry a Retry-After header in seconds. notify's retry helper does
+  not know about it; notion.py does its own retries for that reason.
+
 ## Storage and backups
 
 C: had 0.7 GB free at one point and is still tight. D: is the M.2 with the repo.
@@ -263,7 +299,7 @@ queries.
 
 ## Current phase
 
-Phase 6: Notion coursework.
+Phase 7: Ollama briefing layer.
 
 ```
 1   Weather + news to console                          DONE
@@ -271,8 +307,8 @@ Phase 6: Notion coursework.
 3   SQLite + backup to F:                              DONE
 4   Free-text training and injury logging              DONE
 5   WHOOP OAuth + backfill                             DONE
-6   Notion coursework                                  current
-7   Ollama briefing layer
+6   Notion coursework                                  DONE
+7   Ollama briefing layer                              current
 7b  Re-parse all historical log_entries with the LLM
 8   NYU team calendar (~November)
 9   Q&A over history via text-to-SQL

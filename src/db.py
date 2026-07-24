@@ -358,6 +358,60 @@ def upsert_whoop_workout(row: dict, path: Path | None = None) -> None:
         conn.close()
 
 
+_TASK_COLUMNS = ("title", "course", "due_date", "status")
+
+_UPSERT_TASK = f"""
+INSERT INTO tasks (id, {", ".join(_TASK_COLUMNS)}, raw_json, fetched_at)
+VALUES (:id, {", ".join(f":{c}" for c in _TASK_COLUMNS)}, :raw_json, :fetched_at)
+ON CONFLICT(id) DO UPDATE SET
+    {", ".join(f"{c} = excluded.{c}" for c in (*_TASK_COLUMNS, "raw_json"))},
+    fetched_at = excluded.fetched_at
+"""
+
+
+def upsert_task(row: dict, path: Path | None = None) -> None:
+    """Insert or update one Notion task, keyed on the Notion page id.
+
+    Overwrites rather than COALESCEs, like whoop_workouts and unlike
+    daily_metrics: Notion is the source of truth for these rows and every edit
+    there, including clearing a due date back to NULL, must propagate here on the
+    next fetch. COALESCE semantics would pin the old date forever.
+
+    One asymmetry to know about: fetch() filters out Done tasks, so a task
+    finished in Notion stops being re-fetched and its row here keeps the last
+    status seen before it was done. The table is a cache of what the briefing
+    showed, not a mirror of the whole database.
+
+    Args:
+        row: needs 'id' (Notion page id). Extra keys like 'type' and 'url' ride
+            along inside raw_json rather than getting columns, since the phase 3
+            schema predates them and history is recoverable from raw anyway.
+
+    Raises:
+        ValueError: if 'id' is missing.
+    """
+    if not row.get("id"):
+        raise ValueError("task row needs an 'id' (Notion page id)")
+
+    raw_json = row.get("raw_json")
+    if raw_json is None and row.get("raw") is not None:
+        raw_json = json.dumps(row["raw"], default=str)
+
+    params = {
+        "id": row["id"],
+        "raw_json": raw_json,
+        "fetched_at": row.get("fetched_at") or datetime.now(timezone.utc).isoformat(),
+        **{column: row.get(column) for column in _TASK_COLUMNS},
+    }
+
+    conn = connect(path)
+    try:
+        with conn:
+            conn.execute(_UPSERT_TASK, params)
+    finally:
+        conn.close()
+
+
 def insert_log_entry(
     raw_text: str,
     received_at: str | None = None,
