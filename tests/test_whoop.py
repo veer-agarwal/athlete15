@@ -262,7 +262,39 @@ def _audit_sleep(sleep_id: str, end_utc: str) -> dict:
     }
 
 
-def test_audit_buckets_workout_onto_matching_cycle_date_and_empties_the_rest(monkeypatch):
+def test_metric_date_without_sleep_labels_by_cycle_start_not_end():
+    """A cycle with no scored sleep is labeled by its START.
+
+    Regression for real cycle 1644738825, which ran 2026-07-16 01:09 to
+    2026-07-17 02:35 local and was labeled 07-17 by its end. That is the day the
+    NEXT cycle starts, so the label collided with its successor and shifted the
+    whole week forward.
+    """
+    cycle = {
+        "id": 1644738825,
+        "start": "2026-07-16T05:09:00.000Z",  # local 2026-07-16 01:09
+        "end": "2026-07-17T06:35:00.000Z",    # local 2026-07-17 02:35
+        "timezone_offset": "-04:00",
+    }
+    assert whoop._metric_date(cycle, None) == "2026-07-16"
+
+
+def test_metric_date_prefers_sleep_end_over_cycle_start():
+    """With a scored sleep, the wake instant still wins.
+
+    Cycle start is a bedtime; on a pre-midnight bedtime it lands on the previous
+    calendar day, while the sleep end is the morning you actually woke up.
+    """
+    cycle = {
+        "start": "2026-07-23T03:00:00.000Z",  # local 2026-07-22 23:00
+        "end": "2026-07-24T03:00:00.000Z",
+        "timezone_offset": "-04:00",
+    }
+    sleep = {"end": "2026-07-23T11:00:00.000Z", "timezone_offset": "-04:00"}  # local 07:00
+    assert whoop._metric_date(cycle, sleep) == "2026-07-23"
+
+
+def test_audit_buckets_workout_by_cycle_containment_not_date(monkeypatch):
     cycles = [
         {
             "id": "cycle1",
@@ -295,14 +327,33 @@ def test_audit_buckets_workout_onto_matching_cycle_date_and_empties_the_rest(mon
     monkeypatch.setattr(whoop, "_authorized_client", lambda: fake)
     monkeypatch.setattr(
         whoop, "fetch_workouts",
-        lambda start_date=None: [{
-            "date": "2026-07-23",
-            "sport_name": "volleyball",
-            "sport_id": 34,
-            "duration_min": 90,
-            "strain": 12.0,
-            "start_utc": "2026-07-23T20:00:00.000Z",
-        }],
+        lambda start_date=None: [
+            {
+                # Local date 07-22, which does NOT match cycle1's assigned label
+                # of 07-23, but the start instant falls inside cycle1's window.
+                # Containment must place it here; date equality would not.
+                "id": "w-inside",
+                "date": "2026-07-22",
+                "sport_name": "volleyball",
+                "sport_id": 34,
+                "duration_min": 90,
+                "strain": 12.0,
+                "start_utc": "2026-07-23T02:00:00.000Z",
+            },
+            {
+                # Sits in the gap between cycle1's end and cycle2's start, and
+                # its local date matches cycle1's label. It belongs to neither
+                # cycle and must not be filed onto one on the strength of the
+                # date alone.
+                "id": "w-gap",
+                "date": "2026-07-23",
+                "sport_name": "golf",
+                "sport_id": 22,
+                "duration_min": 60,
+                "strain": 4.0,
+                "start_utc": "2026-07-23T20:00:00.000Z",
+            },
+        ],
     )
 
     rows = whoop.audit(days=7)
@@ -322,8 +373,8 @@ def test_audit_buckets_workout_onto_matching_cycle_date_and_empties_the_rest(mon
         {"sport": "volleyball", "duration_min": 90, "strain": 12.0}
     ]
 
-    # The cycle with no matching workout gets an empty list, not an omitted key
-    # or None.
+    # The cycle with no contained workout gets an empty list, not an omitted key
+    # or None. The gap workout is filed nowhere rather than onto both cycles.
     day2 = by_date["2026-07-24"]
     assert day2["workouts"] == []
 

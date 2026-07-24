@@ -242,7 +242,10 @@ def whoop_audit() -> int:
     def num(value: float | int | None, spec: str) -> str:
         return format(value, spec) if value is not None else "-"
 
-    print("WHOOP audit, last 7 days (local time). Diff against the WHOOP app.\n")
+    # Count the rows actually printed rather than restating the requested window:
+    # a 7 day lookback spans 8 calendar days inclusive and can return 9 cycles once
+    # the in-progress one is included, so "last 7 days" read as a miscount.
+    print(f"WHOOP audit, {len(rows)} cycles (local time). Diff against the WHOOP app.\n")
     for row in rows:
         print(f"{row['date']}  cycle {row['cycle_id']}")
         print(f"    start {row['start_local']}    end {row['end_local']}")

@@ -292,16 +292,19 @@ def _local_dt_str(timestamp: str | None, offset: str | None) -> str:
 def _metric_date(cycle: dict, sleep: dict | None) -> str:
     """The date this row belongs to: the local date you woke up.
 
-    A WHOOP cycle runs from falling asleep to falling asleep the next night, so
-    neither of its own endpoints is the wake date. `start` lands on the previous
-    evening, and `end` lands on the following one, which crosses midnight on every
-    night you get to bed after 12. The end of the sleep at the head of the cycle is
-    the actual wake instant, so prefer that. The cycle endpoints are a fallback for
-    rows backfill wrote without a matching sleep record.
+    A WHOOP cycle runs from one sleep onset to the next, so both of its own
+    endpoints are bedtimes rather than the waking day. The end of the sleep at the
+    head of the cycle is the actual wake instant, so prefer that.
+
+    The fallback, used for cycles seen without a scored sleep, is the cycle START.
+    Never the end: a cycle's end IS the next cycle's start, so labeling by it shifts
+    every day forward and hands each cycle the date belonging to its successor. On
+    real data that mislabeled cycle 1644738825 (2026-07-16 01:09 to 2026-07-17
+    02:35) as 07-17, which is the day the following cycle actually starts.
     """
     if sleep and sleep.get("end"):
         return _local_date(sleep["end"], sleep.get("timezone_offset"))
-    return _local_date(cycle.get("end") or cycle["start"], cycle.get("timezone_offset"))
+    return _local_date(cycle["start"], cycle.get("timezone_offset"))
 
 
 def _sleep_hours(sleep: dict | None) -> float | None:
@@ -585,9 +588,15 @@ def audit(days: int = 7) -> list[dict]:
     recovery_by_cycle = {r["cycle_id"]: r for r in recoveries if _scored(r)}
     sleep_by_id = {s["id"]: s for s in sleeps if _scored(s)}
 
-    workouts_by_date: dict[str, list[dict]] = {}
-    for workout in workouts:
-        workouts_by_date.setdefault(workout["date"], []).append(workout)
+    def _instant(timestamp: str | None) -> datetime | None:
+        """A WHOOP UTC timestamp as an aware datetime, for interval comparison."""
+        if not timestamp:
+            return None
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+
+    # Which cycles claimed each workout, so an overlap can be reported rather than
+    # silently double counted.
+    claimed_by: dict[str, list] = {}
 
     rows = []
     for cycle in cycles:
@@ -598,6 +607,25 @@ def audit(days: int = 7) -> list[dict]:
         recovery_score = (recovery or {}).get("score") or {}
         sleep_score = (sleep or {}).get("score") or {}
         cycle_score = cycle.get("score") or {}
+
+        # Containment, not date equality: a workout belongs to the cycle whose
+        # [start, end) window contains its START instant. Matching on local date
+        # put a workout under every cycle sharing that label, and filed anything
+        # after midnight under the wrong day. Matched on start only, so a session
+        # running past the cycle boundary still counts once, against the day it
+        # began. The open-ended in-progress cycle has no end and takes everything
+        # from its start onward.
+        cycle_start = _instant(cycle.get("start"))
+        cycle_end = _instant(cycle.get("end"))
+        contained = []
+        for workout in workouts:
+            began = _instant(workout.get("start_utc"))
+            if began is None or cycle_start is None or began < cycle_start:
+                continue
+            if cycle_end is not None and began >= cycle_end:
+                continue
+            contained.append(workout)
+            claimed_by.setdefault(workout["id"], []).append(cycle.get("id"))
 
         rows.append({
             "date": assigned,
@@ -615,11 +643,17 @@ def audit(days: int = 7) -> list[dict]:
                     "strain": workout.get("strain"),
                 }
                 for workout in sorted(
-                    workouts_by_date.get(assigned, []),
-                    key=lambda w: w.get("start_utc") or "",
+                    contained, key=lambda w: w.get("start_utc") or ""
                 )
             ],
         })
+
+    for workout_id, cycle_ids in claimed_by.items():
+        if len(cycle_ids) > 1:
+            logging.warning(
+                "whoop audit: workout %s falls in %d cycles (%s), cycle windows overlap",
+                workout_id, len(cycle_ids), cycle_ids,
+            )
 
     return rows
 
