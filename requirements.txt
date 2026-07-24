@@ -11,7 +11,15 @@ APScheduler==3.10.4
 whoop==1.0.1
 
 # Phase 7 (athletics .ics)
-icalendar==6.1.0
+# Bumped from 6.1.0: caldav's Calendar.search()/date_search() go through
+# icalendar_searcher, which imports `icalendar.error`, a module only added in
+# icalendar 6.2.0. On 6.1.0 every caldav search() call raised ImportError.
+# See src/sources/calendar.py's module docstring.
+icalendar==6.3.2
+
+# iCloud calendar (CalDAV)
+caldav==3.2.1
+vobject==0.9.9
 
 # Dev
 pytest==8.3.3

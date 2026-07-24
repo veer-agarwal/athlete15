@@ -55,7 +55,23 @@ NOTION_PARENT_PAGE_ID = os.getenv("NOTION_PARENT_PAGE_ID", "")
 
 # --- Ollama (phase 7) ---
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.3:8b")
+# The briefing model. Qwen3 is a hybrid thinking model; llm.py disables thinking
+# in the request, so any model swapped in here should tolerate "think": false.
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+# Smaller, faster model for interactive replies later. Declared now so the config
+# shape is visible; nothing reads it yet. `or` rather than a getenv default
+# because .env.example ships the key empty, and an empty string is "set" as far
+# as getenv defaults are concerned.
+OLLAMA_MODEL_FAST = os.getenv("OLLAMA_MODEL_FAST") or OLLAMA_MODEL
+
+# --- iCloud calendar (CalDAV) ---
+# ICLOUD_APP_PASSWORD must be an app-specific password from appleid.apple.com,
+# not the Apple ID password. Apple revokes all app-specific passwords whenever
+# the Apple ID password changes, so a 401 weeks from now likely means that.
+ICLOUD_USERNAME = os.getenv("ICLOUD_USERNAME", "")
+ICLOUD_APP_PASSWORD = os.getenv("ICLOUD_APP_PASSWORD", "")
+# The one calendar create_event() may write to. Reads span all calendars.
+ICLOUD_CALENDAR_NAME = os.getenv("ICLOUD_CALENDAR_NAME", "athlete15")
 
 # --- Athletics (phase 8) ---
 ATHLETICS_ICS_URL = os.getenv("ATHLETICS_ICS_URL", "")

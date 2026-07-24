@@ -274,6 +274,69 @@ def fetch() -> list[dict]:
     return tasks
 
 
+def create_task(
+    title: str,
+    due_date: str | None = None,
+    course: str | None = None,
+    task_type: str | None = None,
+) -> dict:
+    """Create one page in the coursework data source. Status is left unset so
+    Notion applies its own default ("Not started").
+
+    TRAP, easy to miss: Notion's API does not validate Course/Type against the
+    select options that already exist in the UI. Handing it a value that is
+    not an existing option does not fail, it silently CREATES a new option and
+    attaches it to this page, and that option is now permanent in the
+    database schema until someone removes it by hand in the UI. This function
+    deliberately does NOT validate course/task_type against a hardcoded list
+    before calling the API (CLAUDE.md forbids hardcoding the course list,
+    since it grows as courses change), so a typo here becomes a permanent
+    schema change, not a rejected request. Callers that construct these values
+    from free text or an LLM extraction should be the ones deciding whether to
+    double check spelling first.
+
+    Args:
+        title: becomes the Name (title) property. Required, since a task with
+            no name is not a task.
+        due_date: "YYYY-MM-DD", or None to leave Due empty.
+        course: a Course select option name, or None to leave Course empty.
+        task_type: a Type select option name, or None to leave Type empty.
+
+    Returns:
+        {"id", "title", "due_date", "url"} for the created page.
+
+    Raises:
+        RuntimeError: same cases as _api()/fetch(): non-2xx after retries,
+            4xx config errors, or an unparseable body.
+        requests.RequestException: network failure past the retries.
+    """
+    properties: dict[str, Any] = {
+        "Name": {"title": [{"text": {"content": title}}]},
+    }
+    if due_date is not None:
+        properties["Due"] = {"date": {"start": due_date}}
+    if course is not None:
+        properties["Course"] = {"select": {"name": course}}
+    if task_type is not None:
+        properties["Type"] = {"select": {"name": task_type}}
+
+    payload = {
+        # Since 2025-09-03, a page's parent is a data source, not the database
+        # itself; see the module docstring's API version note.
+        "parent": {"type": "data_source_id", "data_source_id": _data_source_id()},
+        "properties": properties,
+    }
+
+    page = _api("POST", "/pages", payload)
+    properties_out = page.get("properties") or {}
+    return {
+        "id": page.get("id"),
+        "title": extract_title(properties_out.get("Name")),
+        "due_date": extract_date(properties_out.get("Due")),
+        "url": page.get("url"),
+    }
+
+
 if __name__ == "__main__":
     # Run directly to test this module alone:  python -m src.sources.notion
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")

@@ -14,6 +14,8 @@ SECURITY: check that the incoming chat id matches TELEGRAM_CHAT_ID before acting
 any command. Anyone who finds your bot username can message it.
 """
 
+import asyncio
+import html
 import logging
 
 import requests
@@ -26,7 +28,7 @@ from telegram.ext import (
     filters,
 )
 
-from src import config, db, training
+from src import brief, config, router, training
 
 API_BASE = "https://api.telegram.org/bot"
 
@@ -64,13 +66,27 @@ def _split(text: str, limit: int = MAX_MESSAGE_CHARS) -> list[str]:
     return chunks
 
 
-def send(text: str) -> None:
-    """Send a message to the configured chat.
+# Every chunk is wrapped in its own <pre>...</pre>, so the split limit must
+# leave room for the tags. Opening <pre> once for the whole message and letting
+# chunks share it does not work: Telegram parses each message independently and
+# rejects an unclosed tag with a 400.
+_PRE_OVERHEAD = len("<pre></pre>")
 
-    Sent as plain text with no parse_mode. Telegram's MarkdownV2 requires escaping
-    a long list of characters including - . ( ) ! and would reject briefing lines
-    like "high 84 low 61" or any URL. Formatting is not worth a silently failed
-    briefing; revisit only if the message ever needs bold or links.
+
+def send(text: str) -> None:
+    """Send a message to the configured chat, rendered monospace.
+
+    parse_mode HTML with the body wrapped in <pre>: the briefing's fixed
+    template relies on column alignment, and Telegram only guarantees a
+    monospace face inside pre blocks. HTML rather than MarkdownV2 because HTML
+    needs only &, < and > escaped, while MarkdownV2 reserves - . ( ) ! and
+    would reject lines like "high 84, 20% precip" wholesale.
+
+    Escaping happens BEFORE chunking so the length budget is measured on the
+    text actually sent; escaping per chunk could push a chunk back over the
+    limit. The hard-slice branch of _split() could in principle cut through an
+    escaped entity, but only on a single line over ~4000 characters, which
+    nothing here produces.
 
     Uses requests rather than python-telegram-bot because PTB's API is async, and
     this is called from the synchronous APScheduler job. run_bot() will use PTB.
@@ -87,10 +103,15 @@ def send(text: str) -> None:
 
     url = f"{API_BASE}{config.TELEGRAM_BOT_TOKEN}/sendMessage"
 
-    for chunk in _split(text):
+    # quote=False escapes exactly &, < and >, which is all Telegram HTML needs.
+    # The default would also turn quotes into entities for no benefit.
+    escaped = html.escape(text, quote=False)
+
+    for chunk in _split(escaped, limit=MAX_MESSAGE_CHARS - _PRE_OVERHEAD):
         payload = {
             "chat_id": config.TELEGRAM_CHAT_ID,
-            "text": chunk,
+            "text": f"<pre>{chunk}</pre>",
+            "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
         # timeout is not optional. Without it a hung connection blocks the whole
@@ -112,24 +133,6 @@ def send(text: str) -> None:
             )
 
 
-HELP_TEXT = (
-    "athlete15\n"
-    "\n"
-    "Send plain text to log. No command to remember:\n"
-    "  right shoulder 3\n"
-    "  court 90 rpe 6\n"
-    "  lifted 60 min rpe 8\n"
-    "  tweaked my left ankle\n"
-    "  right shoulder resolved\n"
-    "\n"
-    "Everything you send is stored word for word before it is parsed, so a\n"
-    "misread never loses the entry. The reply says what was understood.\n"
-    "\n"
-    "/status  active injuries and current load\n"
-    "/help    this message"
-)
-
-
 def _is_authorized(update: Update) -> bool:
     """Whether an update came from the configured chat.
 
@@ -148,47 +151,32 @@ def _is_authorized(update: Update) -> bool:
 
 
 async def _on_text(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Any non-command text is a log entry.
+    """Any non-command text goes to the intent router.
 
-    Order matters and is the whole point of this handler: the raw text goes to
-    disk first, then parsing runs, then the parse result is attached to the row
-    that already exists. A crash or a parser bug anywhere after the first write
-    costs you a parse, never the entry.
+    router.handle_message owns the whole pipeline now: it writes the raw text to
+    log_entries before anything else, classifies, applies, and never raises. This
+    handler only carries the message across and sends the reply back.
 
-    The database calls are synchronous inside an async handler. They are local
-    SQLite writes on the order of a millisecond, so blocking the event loop for
-    that long is not worth the complexity of a thread pool. Revisit if a handler
-    ever does real network work.
+    asyncio.to_thread runs a blocking function in a worker thread so the
+    seconds-long LLM and CalDAV calls inside the router do not stall the polling
+    event loop. The old handler got away with running its millisecond SQLite
+    writes directly on the loop; the router does real network work and cannot.
     """
     if not _is_authorized(update):
         return
 
+    chat = update.effective_chat
     message = update.effective_message
-    if message is None or not message.text:
+    if chat is None or message is None or not message.text:
         return
 
-    entry_id = db.insert_log_entry(message.text)
-    logging.info("log entry #%d received, %d chars", entry_id, len(message.text))
+    reply = await asyncio.to_thread(router.handle_message, chat.id, message.text)
 
-    try:
-        result = training.parse_entry(message.text)
-        applied = training.apply_entry(result)
-        db.record_parse(
-            entry_id, result, result["parse_status"], result["parse_method"]
-        )
-        reply = training.format_parse_reply(result, applied, entry_id)
-    except Exception:
-        # The entry is already safe on disk. Mark it so a later re-parse can find
-        # it, tell the truth in the reply, and do not raise: an exception escaping
-        # here would be swallowed by PTB and look like the bot ignoring you.
-        logging.exception("parsing entry #%d failed", entry_id)
-        db.record_parse(entry_id, None, "error", training.DEFAULT_PARSE_METHOD)
-        reply = (
-            f"saved entry #{entry_id} but parsing it failed.\n"
-            "the raw text is stored and nothing was lost."
-        )
-
-    await message.reply_text(reply)
+    # Guard the empty case: Telegram rejects a zero-length message with a 400,
+    # and a bare CHAT turn can come back empty. Split the rest, since a chat or
+    # error reply can in principle run past the 4096 ceiling like the briefing.
+    for chunk in _split(reply or "(no reply)"):
+        await message.reply_text(chunk)
 
 
 async def _on_status(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -198,10 +186,23 @@ async def _on_status(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.effective_message.reply_text(training.format_training_block())
 
 
-async def _on_help(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _on_brief(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Build and send the full briefing on demand.
+
+    brief.build() hits every source and can take tens of seconds, so it runs via
+    asyncio.to_thread (worker thread, keeps the polling loop responsive) just
+    like the router call in _on_text.
+    """
     if not _is_authorized(update):
         return
-    await update.effective_message.reply_text(HELP_TEXT)
+    message = update.effective_message
+    if message is None:
+        return
+    text = await asyncio.to_thread(brief.build)
+    # reply_text has the same 4096-char ceiling as sendMessage, and the full
+    # briefing can exceed it. Reuse _split rather than let Telegram 400.
+    for chunk in _split(text):
+        await message.reply_text(chunk)
 
 
 async def _on_unknown_command(
@@ -217,7 +218,8 @@ async def _on_unknown_command(
         return
     await update.effective_message.reply_text(
         "unknown command, and commands are not logged.\n"
-        "send it again without the slash to log it. /help for examples"
+        "send it again without the slash to log it as plain text.\n"
+        "the only commands are /brief and /status"
     )
 
 
@@ -245,7 +247,7 @@ def run_bot() -> None:
 
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler(["start", "help"], _on_help))
+    app.add_handler(CommandHandler("brief", _on_brief))
     app.add_handler(CommandHandler("status", _on_status))
     # Text first, then the catch-all for commands. PTB dispatches to the first
     # matching handler in a group, so the unknown-command fallback has to be

@@ -303,6 +303,60 @@ def upsert_daily_metrics(row: dict, path: Path | None = None) -> None:
         conn.close()
 
 
+def average_metrics(
+    start_date: str, end_date: str, path: Path | None = None
+) -> dict:
+    """Mean recovery and sleep over local dates start..end inclusive.
+
+    Returns {"recovery_score": float | None, "sleep_hours": float | None}.
+    A value is None when no row in the window has that column set; SQL AVG
+    skips NULLs rather than counting them as zero, which is what a baseline
+    wants (a day the strap was on the charger should not drag the average
+    down).
+    """
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            """
+            SELECT AVG(recovery_score) AS recovery_score,
+                   AVG(sleep_hours)    AS sleep_hours
+              FROM daily_metrics
+             WHERE date BETWEEN ? AND ?
+            """,
+            (start_date, end_date),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    return {
+        "recovery_score": row["recovery_score"],
+        "sleep_hours": row["sleep_hours"],
+    }
+
+
+def events_between(start_utc: str, end_utc: str, path: Path | None = None) -> list[dict]:
+    """Events starting in [start_utc, end_utc), ordered by start time.
+
+    Half-open on purpose: a day is midnight to midnight, and an event at
+    exactly the next midnight belongs to tomorrow's briefing, not both.
+    String comparison is correct here because every timestamp in the table is
+    UTC ISO-8601, which sorts lexicographically.
+    """
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM events
+             WHERE start_utc >= ? AND start_utc < ?
+             ORDER BY start_utc
+            """,
+            (start_utc, end_utc),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
 _WORKOUT_COLUMNS = (
     "date",
     "sport_id",

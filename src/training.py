@@ -894,3 +894,155 @@ def format_training_block() -> str:
 def _days_since(onset: str, today: date) -> int:
     """Days an injury has been open, counting the onset day as day 1."""
     return (today - date.fromisoformat(onset)).days + 1
+
+
+# ----------------------------------------------------------------------------------
+# corrections (phase 7 router)
+
+
+def amend_latest_session_rpe(new_rpe: float, on_date: str | None = None) -> dict | None:
+    """Set the RPE on the most recent session of a day (default today).
+
+    Used by the router's correction path ("no, that was 8 not 6") and to
+    complete a session row that was logged without an RPE. Updates the newest
+    row by created_at (id as tiebreak, since two rows in the same second get
+    identical timestamps).
+
+    Returns {"session_id", "old_rpe", "new_rpe", "type"}, or None when the
+    date has no session to amend.
+    """
+    on_date = on_date or _today()
+    # Store an int when the value is whole; the schema column is INTEGER and
+    # every reader formats RPE as one.
+    stored = int(new_rpe) if float(new_rpe) == int(new_rpe) else float(new_rpe)
+
+    conn = db.connect()
+    try:
+        row = conn.execute(
+            """
+            SELECT id, rpe, type FROM sessions
+             WHERE date = ?
+             ORDER BY created_at DESC, id DESC LIMIT 1
+            """,
+            (on_date,),
+        ).fetchone()
+        if row is None:
+            return None
+        with conn:
+            conn.execute(
+                "UPDATE sessions SET rpe = ? WHERE id = ?", (stored, row["id"])
+            )
+    finally:
+        conn.close()
+
+    return {
+        "session_id": int(row["id"]),
+        "old_rpe": row["rpe"],
+        "new_rpe": stored,
+        "type": row["type"],
+    }
+
+
+def amend_latest_pain(
+    on_date: str | None = None,
+    new_score: int | None = None,
+    new_body_part: str | None = None,
+    new_side: str | None = None,
+) -> dict | None:
+    """Amend the most recent pain reading of a day (default today).
+
+    A score change updates the row in place. A body part or side change
+    re-points the row's injury_id at the matching active injury, opening one
+    when nothing matches, because the original reading may have implicitly
+    opened an injury on the wrong part and the pain history must end up
+    attached to the right one.
+
+    When the re-point leaves the OLD injury with no readings at all and it was
+    opened the same day by a pain check-in, that injury row is deleted: it was
+    created by the exact mistake being corrected and would otherwise sit in
+    the briefing as a phantom active injury.
+
+    Returns {"log_id", "injury_id", "old_score", "new_score", "old_body_part",
+    "old_side", "new_body_part", "new_side"}, or None when the date has no
+    pain reading to amend.
+    """
+    on_date = on_date or _today()
+
+    conn = db.connect()
+    try:
+        row = conn.execute(
+            """
+            SELECT l.id AS log_id, l.injury_id, l.pain_0_10,
+                   i.body_part, i.side, i.description, i.onset_date
+              FROM injury_log l JOIN injuries i ON i.id = l.injury_id
+             WHERE l.date = ?
+             ORDER BY l.id DESC LIMIT 1
+            """,
+            (on_date,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        old_injury_id = int(row["injury_id"])
+        injury_id = old_injury_id
+        target_part = new_body_part or row["body_part"]
+        target_side = new_side if new_side is not None else row["side"]
+    finally:
+        conn.close()
+
+    if (new_body_part is not None or new_side is not None) and (
+        target_part != row["body_part"] or target_side != row["side"]
+    ):
+        # _match_active_injury and open_injury manage their own connections,
+        # so this happens between the read above and the write below.
+        matched = _match_active_injury(target_part, target_side)
+        if matched is not None:
+            injury_id = matched
+        else:
+            injury_id = open_injury(
+                target_part,
+                target_side,
+                description="opened by a correction",
+                on_date=on_date,
+            )
+
+    conn = db.connect()
+    try:
+        with conn:
+            conn.execute(
+                """
+                UPDATE injury_log
+                   SET pain_0_10 = COALESCE(?, pain_0_10), injury_id = ?
+                 WHERE id = ?
+                """,
+                (new_score, injury_id, row["log_id"]),
+            )
+            if injury_id != old_injury_id:
+                remaining = conn.execute(
+                    "SELECT COUNT(*) AS n FROM injury_log WHERE injury_id = ?",
+                    (old_injury_id,),
+                ).fetchone()["n"]
+                if (
+                    remaining == 0
+                    and row["onset_date"] == on_date
+                    and row["description"] == "opened by a pain check-in"
+                ):
+                    conn.execute(
+                        "DELETE FROM injuries WHERE id = ?", (old_injury_id,)
+                    )
+                    logging.info(
+                        "deleted phantom injury %d after correction", old_injury_id
+                    )
+    finally:
+        conn.close()
+
+    return {
+        "log_id": int(row["log_id"]),
+        "injury_id": injury_id,
+        "old_score": row["pain_0_10"],
+        "new_score": new_score if new_score is not None else row["pain_0_10"],
+        "old_body_part": row["body_part"],
+        "old_side": row["side"],
+        "new_body_part": target_part,
+        "new_side": target_side,
+    }
