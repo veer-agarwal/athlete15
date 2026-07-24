@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from src import brief, config, db, notify
+from src.sources import whoop
 
 # The machine wakes from S3 sleep to run this and the scheduled task fires on
 # resume, often before the wireless adapter has associated and DNS is answering.
@@ -62,6 +63,34 @@ def send_brief() -> tuple[str, str | None]:
         return text, None
 
 
+def authorize_whoop() -> int:
+    """One-time interactive WHOOP OAuth flow. Returns a process exit code.
+
+    Nothing needs to be listening on the redirect URI. The browser will fail to
+    load http://localhost:8080/callback after you approve, and that is fine: the
+    authorization code is sitting in the address bar of the page that failed, and
+    that whole URL is what gets pasted back here.
+    """
+    if not config.WHOOP_CLIENT_ID or not config.WHOOP_CLIENT_SECRET:
+        print("set WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET in .env first")
+        return 1
+
+    print("\nOpen this URL in a browser and approve access:\n")
+    print(whoop.build_authorize_url())
+    print("\nYou will land on a page that fails to load. That is expected.")
+    print("Copy the full URL out of the address bar and paste it below.\n")
+
+    redirect_url = input("Redirect URL: ").strip()
+    if not redirect_url:
+        print("nothing pasted, aborting")
+        return 1
+
+    whoop.exchange_code(redirect_url)
+    print(f"\ntoken stored at {config.WHOOP_TOKEN_PATH}")
+    print("pull history with: python -m src.sources.whoop backfill YYYY-MM-DD")
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="athlete15")
     parser.add_argument(
@@ -69,9 +98,19 @@ def main() -> None:
         action="store_true",
         help="run the briefing job once immediately and exit",
     )
+    parser.add_argument(
+        "--auth",
+        action="store_true",
+        help="run the one-time WHOOP browser authorization and store the token",
+    )
     args = parser.parse_args()
 
     _configure_logging()
+
+    # Before init_db: authorizing touches no local data, and the scheduler and
+    # database messages would only interleave with the paste prompt.
+    if args.auth:
+        raise SystemExit(authorize_whoop())
 
     db.init_db()
     logging.info("database ready at %s", config.DB_PATH)

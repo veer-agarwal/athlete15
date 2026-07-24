@@ -4,6 +4,7 @@
 *.token
 tokens.json
 brief.log
+whoop_token.json
 
 # Database
 *.db

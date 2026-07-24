@@ -195,3 +195,9 @@ they get filled in early.
 - Trigger the briefing on WHOOP wake detection rather than a fixed 7 AM.
   Either recovery.updated webhook via a tunnel, or poll every 15 min from
   6 AM until the cycle closes. Decide after phase 5.
+
+
+- Wake-triggered briefing instead of fixed 7 AM. Poll WHOOP every 15 min
+  from 6 AM until the sleep cycle closes. Webhooks are the alternative but
+  need a tunnel (Tailscale Funnel) and a machine that is awake to receive.
+  Decide after phase 5 is stable.

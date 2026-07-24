@@ -23,9 +23,23 @@ Two traps specific to WHOOP:
 BACKFILL: on first successful connection, pull your full history with a date range
 query rather than only fetching today. Unlike training data, this history exists
 already and is free to retrieve.
+
+Run the one-time browser step with:  python -m src.main --auth
+Then pull history with:              python -m src.sources.whoop backfill 2024-09-01
 """
-#from whoop import WhoopClient
-from src import config
+
+import json
+import logging
+import sys
+from collections.abc import Callable
+from datetime import date, datetime, timedelta, timezone
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import requests
+from whoop import WhoopClient
+
+from src import config, db
 
 AUTH_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
 TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
@@ -40,29 +54,276 @@ SCOPES = [
     "offline",
 ]
 
-#def _get_client() -> WhoopClient:
-#    return WhoopClient(
-#        config.WHOOP_CLIENT_ID,
-#        config.WHOOP_CLIENT_SECRET,
-#        config.WHOOP_REDIRECT_URI,
-#        scopes=SCOPES,
-#    )
+# How far back fetch() looks for a finished cycle. One day covers the normal case;
+# three tolerates the strap sitting on the charger over a weekend without turning a
+# gap into an error. Anything older than this is backfill's problem, not the
+# morning briefing's.
+FETCH_LOOKBACK_DAYS = 3
 
+# authlib leaves its requests untimed. Same reasoning as the timeout in weather.py:
+# this is a single process, so one hung socket stalls the whole morning job with no
+# upper bound.
+REQUEST_TIMEOUT_SECONDS = 15
+
+# The `state` value from the most recent build_authorize_url() call in this process.
+# See exchange_code() for why it is a module global rather than an argument.
+_auth_state: str | None = None
+
+
+# ----------------------------------------------------------------------------------
+# token persistence
+
+
+def _load_token() -> dict | None:
+    """Read the stored token, or None if there is not one yet."""
+    if not config.WHOOP_TOKEN_PATH.exists():
+        return None
+    return json.loads(config.WHOOP_TOKEN_PATH.read_text(encoding="utf-8"))
+
+
+def _save_token(token: dict) -> None:
+    """Write the token to disk, replacing whatever was there.
+
+    This runs on every refresh, not only at initial authorization. WHOOP rotates
+    the refresh token on each use and invalidates the one you traded in, so a file
+    written once goes stale the first time the access token expires. Nothing fails
+    at that moment; it fails weeks later with an invalid_grant that looks unrelated
+    to anything you did.
+
+    Written to a temp file and renamed rather than truncating in place. A partial
+    write here is not a lost line of data, it is being locked out of the API until
+    the browser step is repeated.
+    """
+    temp_path = config.WHOOP_TOKEN_PATH.with_name(config.WHOOP_TOKEN_PATH.name + ".tmp")
+    # dict() because authlib hands back an OAuth2Token, which json.dumps will only
+    # serialize by accident of it subclassing dict.
+    temp_path.write_text(json.dumps(dict(token), indent=2), encoding="utf-8")
+    temp_path.replace(config.WHOOP_TOKEN_PATH)
+    logging.info("whoop token written to %s", config.WHOOP_TOKEN_PATH)
+
+
+def _get_client(token: dict | None = None) -> WhoopClient:
+    """Build a client. token=None is only for the authorization flow.
+
+    on_token_refresh is the reason every client goes through this helper. authlib
+    refreshes an expired access token transparently mid-request, and without the
+    callback the newly rotated refresh token would exist only in memory and be gone
+    when the process exits.
+    """
+    client = WhoopClient(
+        config.WHOOP_CLIENT_ID,
+        config.WHOOP_CLIENT_SECRET,
+        config.WHOOP_REDIRECT_URI,
+        scopes=SCOPES,
+        token=token,
+        on_token_refresh=_save_token,
+    )
+    client.session.default_timeout = REQUEST_TIMEOUT_SECONDS
+    return client
+
+
+def _authorized_client() -> WhoopClient:
+    """Client built from the stored token.
+
+    Raises:
+        RuntimeError: if no token has been stored yet.
+    """
+    token = _load_token()
+    if token is None:
+        raise RuntimeError(
+            f"no WHOOP token at {config.WHOOP_TOKEN_PATH}, "
+            "run: python -m src.main --auth"
+        )
+    return _get_client(token)
+
+
+# ----------------------------------------------------------------------------------
+# OAuth flow
 
 
 def build_authorize_url() -> str:
     """Return the URL to open in a browser to start the OAuth flow."""
-    raise NotImplementedError("phase 5")
+    global _auth_state
+
+    client = _get_client()
+    try:
+        url, _auth_state = client.authorization_url()
+    finally:
+        client.close()
+    return url
 
 
 def exchange_code(code: str) -> dict:
-    """Trade an authorization code for access and refresh tokens."""
-    raise NotImplementedError("phase 5")
+    """Trade an authorization code for access and refresh tokens.
+
+    Accepts either the bare code or the entire redirect URL you landed on. The URL
+    is what the browser actually gives you, and picking the code out of a query
+    string by hand is a good way to drop a character off the end.
+
+    The token is persisted before this returns, so a crash immediately afterward
+    does not cost you the browser step.
+
+    Raises:
+        authlib.integrations.base_client.errors.OAuthError: if WHOOP rejects the
+            code, usually because it was already used or is older than ten minutes.
+    """
+    client = _get_client()
+    try:
+        if "code=" in code:
+            # state is only meaningful when build_authorize_url() ran in this same
+            # process, which is what --auth does. After a restart there is nothing
+            # to compare against, and authlib skips the check on state=None rather
+            # than failing. Passing it along is free CSRF cover for the common path
+            # without making the uncommon one impossible.
+            token = client.fetch_token(authorization_response=code, state=_auth_state)
+        else:
+            token = client.fetch_token(code=code)
+    finally:
+        client.close()
+
+    _save_token(token)
+    return dict(token)
 
 
 def refresh_access_token() -> dict:
-    """Use the stored refresh token to get a fresh access token."""
-    raise NotImplementedError("phase 5")
+    """Use the stored refresh token to get a fresh access token.
+
+    Not needed on the normal path: any request made through _authorized_client()
+    refreshes itself when the access token has expired. This exists to check that
+    the stored credentials still work without pulling data, and to force the
+    rotation on demand.
+
+    Raises:
+        RuntimeError: if no token has been stored yet.
+    """
+    client = _authorized_client()
+    try:
+        token = client.session.refresh_token(TOKEN_URL)
+    finally:
+        client.close()
+
+    # on_token_refresh already wrote this. Writing again costs one file rename and
+    # means persistence does not silently depend on an authlib callback continuing
+    # to fire across library versions.
+    _save_token(token)
+    return dict(token)
+
+
+# ----------------------------------------------------------------------------------
+# parsing
+
+
+def _local_date(timestamp: str, offset: str | None) -> str:
+    """Local calendar date of a WHOOP timestamp as 'YYYY-MM-DD'.
+
+    Uses the UTC offset WHOOP recorded for the record ('-05:00') rather than
+    assuming America/New_York, so a road trip to a match in a different zone still
+    files the day correctly. Falls back to the configured timezone if the offset is
+    missing or malformed.
+    """
+    moment = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+
+    tzinfo: Any = ZoneInfo(config.TIMEZONE)
+    if offset:
+        try:
+            # strptime %z parses the colon form since 3.7; this is just the least
+            # error prone way to turn '-05:00' into a tzinfo.
+            tzinfo = datetime.strptime(offset, "%z").tzinfo
+        except ValueError:
+            logging.warning(
+                "whoop: unparseable timezone_offset %r, falling back to %s",
+                offset,
+                config.TIMEZONE,
+            )
+
+    return moment.astimezone(tzinfo).strftime("%Y-%m-%d")
+
+
+def _metric_date(cycle: dict, sleep: dict | None) -> str:
+    """The date this row belongs to: the local date you woke up.
+
+    A WHOOP cycle runs from falling asleep to falling asleep the next night, so
+    neither of its own endpoints is the wake date. `start` lands on the previous
+    evening, and `end` lands on the following one, which crosses midnight on every
+    night you get to bed after 12. The end of the sleep at the head of the cycle is
+    the actual wake instant, so prefer that. The cycle endpoints are a fallback for
+    rows backfill wrote without a matching sleep record.
+    """
+    if sleep and sleep.get("end"):
+        return _local_date(sleep["end"], sleep.get("timezone_offset"))
+    return _local_date(cycle.get("end") or cycle["start"], cycle.get("timezone_offset"))
+
+
+def _sleep_hours(sleep: dict | None) -> float | None:
+    """Hours actually asleep, which is time in bed minus time awake."""
+    stages = ((sleep or {}).get("score") or {}).get("stage_summary") or {}
+    in_bed_milli = stages.get("total_in_bed_time_milli")
+    if in_bed_milli is None:
+        return None
+    awake_milli = stages.get("total_awake_time_milli") or 0
+    return round((in_bed_milli - awake_milli) / 3_600_000, 2)
+
+
+def _row(cycle: dict, recovery: dict | None, sleep: dict | None) -> dict:
+    """Flatten one cycle plus its recovery and sleep into a daily_metrics row.
+
+    The keys are exactly what db.upsert_daily_metrics accepts, so backfill can hand
+    the dict straight over without a translation step in between.
+    """
+    strain_score = cycle.get("score") or {}
+    recovery_score = (recovery or {}).get("score") or {}
+    sleep_score = (sleep or {}).get("score") or {}
+
+    return {
+        "date": _metric_date(cycle, sleep),
+        "recovery_score": recovery_score.get("recovery_score"),
+        "hrv_ms": recovery_score.get("hrv_rmssd_milli"),
+        "resting_hr": recovery_score.get("resting_heart_rate"),
+        "sleep_hours": _sleep_hours(sleep),
+        "sleep_performance": sleep_score.get("sleep_performance_percentage"),
+        "strain": strain_score.get("strain"),
+        # Whole payloads, per the storage convention in CLAUDE.md. Everything not
+        # parsed above (spo2, skin temp, respiratory rate, the sleep stage
+        # breakdown, sleep debt) is already in hand, and WHOOP history is not
+        # guaranteed to still be re-fetchable when you decide you want it.
+        "raw": {"cycle": cycle, "recovery": recovery, "sleep": sleep},
+    }
+
+
+def _is_finished(cycle: dict) -> bool:
+    """Whether WHOOP has both closed and scored this cycle.
+
+    `end` is null for the cycle you are currently living in. score_state stays
+    PENDING_SCORE until the strap syncs after you wake and the numbers settle, so a
+    closed cycle is still not a usable one.
+    """
+    return bool(cycle.get("end")) and cycle.get("score_state") == "SCORED"
+
+
+def _scored(record: dict | None) -> dict | None:
+    """The record if WHOOP finished scoring it, otherwise None."""
+    if record and record.get("score_state") == "SCORED":
+        return record
+    return None
+
+
+def _get_or_none(call: Callable[..., dict], *args: Any) -> dict | None:
+    """Call a client getter, turning a 404 into None.
+
+    WHOOP 404s the recovery and sleep sub-resources of a cycle that does not have
+    one rather than returning an empty body, and "you have not slept yet" is not an
+    error condition here. Every other status still raises.
+    """
+    try:
+        return call(*args)
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            return None
+        raise
+
+
+# ----------------------------------------------------------------------------------
+# public source contract
 
 
 def fetch() -> list[dict]:
@@ -70,13 +331,177 @@ def fetch() -> list[dict]:
 
     Returns an empty list when the sleep cycle has not closed yet. That is a normal
     condition, not an error.
+
+    "Complete" means the cycle has closed and all three of the cycle, its recovery
+    and its sleep are SCORED. Day strain only finishes accumulating when the cycle
+    ends, so at 7:00 AM the newest complete day is yesterday, not today. If you woke
+    up but the strap has not synced, nothing is scored yet and you get [] instead.
+
+    Raises:
+        RuntimeError: if no token has been stored yet.
+        requests.HTTPError: for any API failure other than a 404 on a
+            sub-resource that does not exist.
     """
-    raise NotImplementedError("phase 5")
+    start = datetime.now(timezone.utc).date() - timedelta(days=FETCH_LOOKBACK_DAYS)
+
+    client = _authorized_client()
+    try:
+        # The collection endpoint sorts newest first, so the first cycle that has
+        # everything is the one we want.
+        for cycle in client.get_cycle_collection(start_date=start.isoformat()):
+            if not _is_finished(cycle):
+                continue
+
+            recovery = _scored(_get_or_none(client.get_recovery_for_cycle, cycle["id"]))
+            if recovery is None:
+                logging.info("whoop: cycle %s has no scored recovery", cycle["id"])
+                continue
+
+            sleep = _sleep_for(client, cycle, recovery)
+            if sleep is None:
+                logging.info("whoop: cycle %s has no scored sleep", cycle["id"])
+                continue
+
+            return [_row(cycle, recovery, sleep)]
+    finally:
+        client.close()
+
+    logging.info(
+        "whoop: no complete cycle in the last %d days, sleep has not closed yet",
+        FETCH_LOOKBACK_DAYS,
+    )
+    return []
+
+
+def _sleep_for(client: WhoopClient, cycle: dict, recovery: dict) -> dict | None:
+    """The sleep that produced this recovery.
+
+    Goes through recovery['sleep_id'] rather than the cycle's own sleep endpoint.
+    Recovery is scored from one specific sleep, and reporting a recovery number
+    next to a different night's sleep is the kind of quiet mismatch you would never
+    catch by reading the briefing. The cycle lookup is a fallback for older records
+    with no sleep_id, and for naps confusing the association.
+    """
+    sleep_id = recovery.get("sleep_id")
+    if sleep_id:
+        sleep = _scored(_get_or_none(client.get_sleep_by_id, sleep_id))
+        if sleep is not None:
+            return sleep
+    return _scored(_get_or_none(client.get_sleep_for_cycle, cycle["id"]))
+
+
+def format_lines(metrics: dict) -> list[str]:
+    """Recovery and sleep numbers for the briefing.
+
+    Dated explicitly, and that is not decoration. Day strain only finishes
+    accumulating when the cycle closes, so until tonight's bedtime the newest
+    complete day is yesterday. Printing yesterday's recovery score bare, directly
+    under a header stamped with today's date, would read as today's number.
+
+    Fields that WHOOP did not score are dropped rather than printed as a dash, so
+    a partial day stays readable.
+
+    Everything is formatted through an explicit precision. WHOOP sends
+    recovery_score, resting_heart_rate and sleep_performance_percentage as floats
+    even though they are whole numbers and the column types are INTEGER, so
+    interpolating them directly prints "recovery 72.0%". SQLite quietly converts
+    them on the way into daily_metrics; this is only a display concern.
+    """
+    parts = []
+    if metrics.get("recovery_score") is not None:
+        parts.append(f"recovery {metrics['recovery_score']:.0f}%")
+    if metrics.get("sleep_hours") is not None:
+        parts.append(f"sleep {metrics['sleep_hours']:.1f}h")
+    if metrics.get("sleep_performance") is not None:
+        parts.append(f"sleep performance {metrics['sleep_performance']:.0f}%")
+    if metrics.get("hrv_ms") is not None:
+        parts.append(f"HRV {metrics['hrv_ms']:.0f}ms")
+    if metrics.get("resting_hr") is not None:
+        parts.append(f"RHR {metrics['resting_hr']:.0f}")
+
+    if not parts:
+        return ["WHOOP: cycle recorded but no scored metrics"]
+
+    day = datetime.strptime(metrics["date"], "%Y-%m-%d").strftime("%a %b %d")
+    return [f"{', '.join(parts)} ({day})"]
 
 
 def backfill(start_date: str) -> int:
     """Pull all history from start_date to now into daily_metrics.
 
+    Uses the three collection endpoints and joins them locally rather than making
+    two extra calls per cycle. Over a year of history that is roughly 45 requests
+    instead of 730, which matters against WHOOP's rate limit and is the difference
+    between this taking seconds and taking minutes.
+
+    More forgiving than fetch(): a day with a scored recovery but no scored sleep is
+    written with the sleep columns left NULL. db.upsert_daily_metrics COALESCEs on
+    conflict, so re-running this later fills those in rather than overwriting good
+    values with nulls.
+
+    Args:
+        start_date: 'YYYY-MM-DD'. Interpreted as the start of that day in UTC.
+
     Returns the number of days written.
+
+    Raises:
+        RuntimeError: if no token has been stored yet.
+        ValueError: if start_date is not a parseable date, or is in the future.
     """
-    raise NotImplementedError("phase 5")
+    # Widen the sleep window by a day. The sleep that scored the earliest cycle in
+    # range began the night before that cycle's start and would otherwise fall
+    # outside the query, silently costing that one day its sleep columns.
+    try:
+        sleep_start = (date.fromisoformat(start_date[:10]) - timedelta(days=1)).isoformat()
+    except ValueError:
+        sleep_start = start_date
+
+    client = _authorized_client()
+    try:
+        cycles = client.get_cycle_collection(start_date=start_date)
+        recoveries = client.get_recovery_collection(start_date=start_date)
+        sleeps = client.get_sleep_collection(start_date=sleep_start)
+    finally:
+        client.close()
+
+    recovery_by_cycle = {r["cycle_id"]: r for r in recoveries if _scored(r)}
+    sleep_by_id = {s["id"]: s for s in sleeps if _scored(s)}
+
+    written = 0
+    for cycle in cycles:
+        # Skips the cycle currently in progress, whose strain is still climbing.
+        if not _is_finished(cycle):
+            continue
+
+        recovery = recovery_by_cycle.get(cycle["id"])
+        sleep = sleep_by_id.get(recovery.get("sleep_id")) if recovery else None
+
+        db.upsert_daily_metrics(_row(cycle, recovery, sleep))
+        written += 1
+
+    logging.info(
+        "whoop backfill: %d day(s) written from %s, %d cycle(s) seen",
+        written,
+        start_date,
+        len(cycles),
+    )
+    return written
+
+
+if __name__ == "__main__":
+    # Test this module alone:
+    #   python -m src.sources.whoop
+    #   python -m src.sources.whoop backfill 2024-09-01
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    if len(sys.argv) > 1 and sys.argv[1] == "backfill":
+        if len(sys.argv) < 3:
+            sys.exit("usage: python -m src.sources.whoop backfill YYYY-MM-DD")
+        db.init_db()
+        print(f"{backfill(sys.argv[2])} day(s) written")
+    else:
+        rows = fetch()
+        if not rows:
+            print("no complete cycle yet")
+        for row in rows:
+            print({k: v for k, v in row.items() if k != "raw"})

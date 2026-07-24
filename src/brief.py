@@ -23,8 +23,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-from src import config
-from src.sources import weather, news
+from src import config, db
+from src.sources import weather, news, whoop
 
 # Retry policy for source fetches. The failure being handled is a network adapter
 # that has not associated yet after an S3 wake, so backoff is fixed rather than
@@ -37,13 +37,17 @@ RETRY_BACKOFF_SECONDS = 10
 def build() -> str:
     """Assemble the full briefing text.
 
-    Phase 2 version: weather and news only, plain template, no LLM.
-    Later phases add sections and hand the assembled facts to llm.py for phrasing.
+    Recovery, weather and news, plain template, no LLM. Later phases add sections
+    and hand the assembled facts to llm.py for phrasing.
     """
     # Header stamped in local time. Everything stored is UTC per the conventions;
     # this is display, so it converts here.
     today = datetime.now(ZoneInfo(config.TIMEZONE))
     lines = [f"athlete15 briefing, {today.strftime('%a %b %d')}", ""]
+
+    lines.append("Recovery")
+    lines.extend(_whoop_lines())
+    lines.append("")
 
     lines.append("Weather")
     lines.extend(_weather_lines())
@@ -86,6 +90,48 @@ def _fetch_with_retry(
             return items
 
     raise AssertionError("unreachable")  # the loop always returns or raises
+
+
+def _whoop_lines() -> list[str]:
+    """Recovery section body, and the day's metrics into daily_metrics.
+
+    This is the only section that persists what it fetched. WHOOP is the source
+    the briefing is expected to trend over later, and the round trip has already
+    been paid for here, so storing it now saves a second identical call.
+
+    The write happens after the lines are built and cannot take the section down
+    with it. The numbers are already in hand at that point, and a locked database
+    is not a reason to drop them from the message.
+    """
+    try:
+        # RuntimeError, which is what fetch() raises for a missing token, is
+        # deliberately not in the retry set. An absent whoop_token.json does not
+        # resolve itself in ten seconds, and retrying would add half a minute to
+        # every briefing for as long as it went unnoticed.
+        items = _fetch_with_retry("whoop", whoop.fetch, requests.RequestException)
+    except Exception as exc:
+        logging.warning("whoop section unavailable: %s", exc)
+        return [f"WHOOP unavailable ({exc})"]
+
+    if not items:
+        # Expected before the strap syncs after you wake, not a failure. See
+        # whoop.fetch() for why the cycle has to close first.
+        logging.info("whoop: sleep cycle has not closed yet")
+        return ["WHOOP: no completed sleep cycle yet"]
+
+    metrics = items[0]
+    lines = whoop.format_lines(metrics)
+
+    try:
+        # The dict from whoop.fetch() is already shaped for this, raw payload and
+        # all. upsert means re-running the briefing the same morning updates the
+        # row rather than failing on the primary key.
+        db.upsert_daily_metrics(metrics)
+        logging.info("whoop metrics stored for %s", metrics["date"])
+    except Exception:
+        logging.exception("storing whoop metrics failed, briefing continues")
+
+    return lines
 
 
 def _weather_lines() -> list[str]:

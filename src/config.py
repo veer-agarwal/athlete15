@@ -39,6 +39,11 @@ WHOOP_CLIENT_SECRET = os.getenv("WHOOP_CLIENT_SECRET", "")
 WHOOP_REDIRECT_URI = os.getenv("WHOOP_REDIRECT_URI", "http://localhost:8080/callback")
 WHOOP_API_BASE = "https://api.prod.whoop.com"
 
+# OAuth tokens, rewritten on every refresh. Not in .env because this file is
+# machine-written rather than hand-edited, and the refresh token rotates. Already
+# gitignored.
+WHOOP_TOKEN_PATH = ROOT / "whoop_token.json"
+
 # --- Notion (phase 6) ---
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
 NOTION_TASKS_DB_ID = os.getenv("NOTION_TASKS_DB_ID", "")
