@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS daily_metrics (
 CREATE TABLE IF NOT EXISTS whoop_workouts (
     id           TEXT PRIMARY KEY,       -- WHOOP v2 workout UUID
     date         TEXT NOT NULL,          -- local date the workout started
-    sport_id     INTEGER,                -- WHOOP's integer, not a name
+    sport_id     INTEGER,                -- WHOOP's integer
+    sport_name   TEXT,                   -- WHOOP's own label, e.g. 'volleyball'
     start_utc    TEXT NOT NULL,
     end_utc      TEXT,
     duration_min INTEGER,
@@ -177,6 +178,22 @@ def init_db(path: Path | None = None) -> None:
     """Create all tables if they do not exist. Safe to call on every startup."""
     with connect(path) as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Additive column migrations for databases created before a column existed.
+
+    CREATE TABLE IF NOT EXISTS never alters an existing table, so a column added
+    to SCHEMA after a database was first created has to be backfilled here. Each
+    step is guarded by a PRAGMA check so this stays idempotent and safe to run on
+    every startup. sport_name was added once workouts started carrying WHOOP's own
+    label; existing rows keep it NULL until their next re-fetch overwrites them.
+    """
+    workout_cols = {row["name"] for row in conn.execute("PRAGMA table_info(whoop_workouts)")}
+    if "sport_name" not in workout_cols:
+        conn.execute("ALTER TABLE whoop_workouts ADD COLUMN sport_name TEXT")
+        logging.info("db migration: added whoop_workouts.sport_name")
 
 
 if __name__ == "__main__":
@@ -360,6 +377,7 @@ def events_between(start_utc: str, end_utc: str, path: Path | None = None) -> li
 _WORKOUT_COLUMNS = (
     "date",
     "sport_id",
+    "sport_name",
     "start_utc",
     "end_utc",
     "duration_min",
@@ -520,6 +538,46 @@ def record_parse(
             )
     finally:
         conn.close()
+
+
+def brief_exists(date: str, path: Path | None = None) -> bool:
+    """Whether a briefing row is already stored for this local date.
+
+    Used by the wake-triggered job to stay idempotent: if the machine woke,
+    delivered, and slept again, a second wake the same morning must not send a
+    duplicate. A row exists whether or not delivery succeeded (sent_at may be
+    NULL), which is deliberate: we do not want to rebuild and resend just
+    because Telegram was down once.
+    """
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM briefs WHERE date = ? LIMIT 1", (date,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return row is not None
+
+
+def whoop_workouts_between(
+    start: str, end: str, path: Path | None = None
+) -> list[dict]:
+    """WHOOP-recorded workouts with local date between start and end inclusive.
+
+    These are the strap's own activities (whoop_workouts), kept separate from the
+    hand-logged `sessions` table. Ordered by start time so a two-a-day reads in
+    the order it happened.
+    """
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM whoop_workouts WHERE date BETWEEN ? AND ? "
+            "ORDER BY start_utc",
+            (start, end),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
 
 
 def record_brief(
