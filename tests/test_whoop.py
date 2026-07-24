@@ -8,14 +8,14 @@ Run with:  pytest tests/test_whoop.py
 """
 
 import json
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 import requests
 from authlib.integrations.base_client.errors import OAuthError
 
-from src import config
+from src import config, db
 from src.sources import whoop
 
 
@@ -396,7 +396,7 @@ def test_audit_oauth_error_raises_whoop_auth_error(monkeypatch):
     assert fake.closed is True
 
 
-def test_audit_marks_which_cycle_the_briefing_reads_each_field_from(monkeypatch):
+def test_audit_tags_which_cycle_the_briefing_reads_each_field_from(monkeypatch):
     """The open cycle is 'current', the newest closed-and-scored one 'completed'.
 
     Mirrors the real morning: cycle 1664667247 opened at 01:24 today and carries
@@ -437,7 +437,7 @@ def test_audit_marks_which_cycle_the_briefing_reads_each_field_from(monkeypatch)
     monkeypatch.setattr(whoop, "_authorized_client", lambda: fake)
     monkeypatch.setattr(whoop, "fetch_workouts", lambda start_date=None: [])
 
-    roles = {row["cycle_id"]: row["briefing_role"] for row in whoop.audit(days=7)}
+    roles = {row["cycle_id"]: row["cycle_kind"] for row in whoop.audit(days=7)}
 
     assert roles == {"open": "current", "done": "completed", "older": None}
 
@@ -471,14 +471,14 @@ def test_audit_completed_role_skips_a_cycle_with_no_scored_recovery(monkeypatch)
     monkeypatch.setattr(whoop, "_authorized_client", lambda: fake)
     monkeypatch.setattr(whoop, "fetch_workouts", lambda start_date=None: [])
 
-    roles = {row["cycle_id"]: row["briefing_role"] for row in whoop.audit(days=7)}
+    roles = {row["cycle_id"]: row["cycle_kind"] for row in whoop.audit(days=7)}
 
     assert roles == {"unscored": None, "usable": "completed"}
 
 
 def test_audit_current_role_withheld_until_the_open_cycle_is_scored(monkeypatch):
-    """Before the strap syncs, fetch_current() returns nothing, so no cycle feeds
-    the header and the table must not claim one does."""
+    """Before the strap syncs, fetch() returns no current row at all, so no cycle
+    feeds the header and the table must not claim one does."""
     cycles = [
         {
             "id": "open", "start": "2026-07-24T05:24:00.000Z", "end": None,
@@ -501,7 +501,7 @@ def test_audit_current_role_withheld_until_the_open_cycle_is_scored(monkeypatch)
     monkeypatch.setattr(whoop, "_authorized_client", lambda: fake)
     monkeypatch.setattr(whoop, "fetch_workouts", lambda start_date=None: [])
 
-    roles = {row["cycle_id"]: row["briefing_role"] for row in whoop.audit(days=7)}
+    roles = {row["cycle_id"]: row["cycle_kind"] for row in whoop.audit(days=7)}
 
     assert roles == {"open": None, "done": "completed"}
 
@@ -510,7 +510,7 @@ def test_audit_resolves_the_opening_sleep_when_recovery_has_no_sleep_id(monkeypa
     """fetch() falls back to the cycle's own sleep endpoint, so audit must too.
 
     Otherwise audit skips a cycle fetch() accepts and names an older one as the
-    strain source, which is the exact drift briefing_role exists to rule out.
+    strain source, which is the exact drift the cycle_kind column rules out.
     """
     cycles = [
         {
@@ -532,7 +532,7 @@ def test_audit_resolves_the_opening_sleep_when_recovery_has_no_sleep_id(monkeypa
 
     row = whoop.audit(days=7)[0]
 
-    assert row["briefing_role"] == "completed"
+    assert row["cycle_kind"] == "completed"
     assert row["sleep_hours"] == 8.0
     assert row["date"] == "2026-07-23"
 
@@ -561,52 +561,62 @@ def test_audit_ignores_a_sleep_that_did_not_open_the_cycle(monkeypatch):
     row = whoop.audit(days=7)[0]
 
     assert row["sleep_hours"] is None
-    assert row["briefing_role"] is None       # fetch() would skip this cycle too
+    assert row["cycle_kind"] is None       # fetch() would skip this cycle too
     assert row["date"] == "2026-07-23"        # dated by its own start, not the nap
 
 
-# --- fetch_current() vs fetch(): the current/completed split ------------------------
+# --- fetch(): the current/completed split ------------------------------------------
 #
-# The bug being locked down: the briefing read recovery, sleep AND strain off the
-# most recently completed cycle. That cycle ended at last night's bedtime, so its
-# sleep is the night BEFORE last and the header was a night stale every morning.
-# Recovery and sleep belong to the cycle in progress, because WHOOP scores recovery
-# when the sleep that OPENS a cycle closes.
+# The bug being locked down: fetch() returned ONLY the most recently completed
+# cycle, so the open cycle was filtered out here, inside the source, before any
+# downstream code could see it. That cycle ENDED at last night's bedtime and its
+# sleep is the night BEFORE last, which is why fixing brief.py changed nothing.
+# Recovery and last night's sleep belong to the cycle in progress, because WHOOP
+# scores recovery when the sleep that OPENS a cycle closes.
+
+FIXTURE_PATH = Path(__file__).parent / "fixtures" / "whoop_cycles.json"
+
+
+@pytest.fixture
+def payload() -> dict:
+    """The saved morning, reloaded per test so one test's mutation cannot leak
+    into the next."""
+    return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
 
 def _http_404() -> requests.HTTPError:
     """A 404 shaped the way _get_or_none expects, for a sub-resource that does not
-    exist yet (WHOOP 404s rather than returning an empty body)."""
+    exist yet (WHOOP 404s those rather than returning an empty body)."""
     response = requests.Response()
     response.status_code = 404
     return requests.HTTPError("404 not found", response=response)
 
 
-class _FakeSplitClient:
-    """Stands in for WhoopClient across fetch() and fetch_current().
+class _FakeCycleClient:
+    """Serves the saved fixture the way the real v2 endpoints serve it.
 
-    Serves one newest-first cycle list plus per-cycle recovery and per-id sleep
-    lookups, 404ing anything absent the way the real endpoints do.
+    Collection call for cycles, per-id lookups for recovery and sleep, and a 404
+    for anything absent. No network: fetch() cannot tell this from the real client.
     """
 
-    def __init__(self, cycles: list[dict], recoveries: dict, sleeps: dict) -> None:
-        self._cycles = cycles
-        self._recoveries = recoveries      # cycle_id -> recovery payload
-        self._sleeps = sleeps              # sleep_id -> sleep payload
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
         self.closed = False
 
     def get_cycle_collection(self, **kwargs):
-        return self._cycles
+        return self.payload["cycles"]
 
     def get_recovery_for_cycle(self, cycle_id):
-        if cycle_id not in self._recoveries:
+        recovery = self.payload["recovery_by_cycle"].get(str(cycle_id))
+        if recovery is None:
             raise _http_404()
-        return self._recoveries[cycle_id]
+        return recovery
 
     def get_sleep_by_id(self, sleep_id):
-        if sleep_id not in self._sleeps:
+        sleep = self.payload["sleep_by_id"].get(sleep_id)
+        if sleep is None:
             raise _http_404()
-        return self._sleeps[sleep_id]
+        return sleep
 
     def get_sleep_for_cycle(self, cycle_id):
         raise _http_404()
@@ -615,216 +625,230 @@ class _FakeSplitClient:
         self.closed = True
 
 
-# The real morning from the audit: cycle 1664667247 opened 2026-07-24 01:24 local
-# and carries last night's 7.5h / 79%. The cycle it closed carries the night before.
-OPEN_CYCLE = {
-    "id": 1664667247,
-    "start": "2026-07-24T05:24:00.000Z",   # local 01:24
-    "end": None,
-    "timezone_offset": "-04:00",
-    "score_state": "PENDING_SCORE",
-    "score": {"strain": 3.2},              # still climbing
-}
-DONE_CYCLE = {
-    "id": 1644738825,
-    "start": "2026-07-23T05:09:00.000Z",   # local 01:09
-    "end": "2026-07-24T05:24:00.000Z",     # local 01:24, where OPEN_CYCLE begins
-    "timezone_offset": "-04:00",
-    "score_state": "SCORED",
-    "score": {"strain": 14.2},
-}
-
-
-def _split_sleep(sleep_id: str, start_utc: str, end_utc: str, hours: float,
-                 performance: int) -> dict:
-    return {
-        "id": sleep_id,
-        "score_state": "SCORED",
-        "start": start_utc,
-        "end": end_utc,
-        "timezone_offset": "-04:00",
-        "score": {
-            "stage_summary": {
-                "total_in_bed_time_milli": int(hours * 3_600_000),
-                "total_awake_time_milli": 0,
-            },
-            "sleep_performance_percentage": performance,
-        },
-    }
-
-
-def _split_client(open_recovery_scored: bool = True) -> _FakeSplitClient:
-    recoveries = {
-        DONE_CYCLE["id"]: {
-            "cycle_id": DONE_CYCLE["id"], "sleep_id": "s-done", "score_state": "SCORED",
-            "score": {"recovery_score": 41, "hrv_rmssd_milli": 55.0,
-                      "resting_heart_rate": 57.0},
-        },
-    }
-    if open_recovery_scored:
-        recoveries[OPEN_CYCLE["id"]] = {
-            "cycle_id": OPEN_CYCLE["id"], "sleep_id": "s-open",
-            "score_state": "SCORED",
-            "score": {"recovery_score": 79, "hrv_rmssd_milli": 70.0,
-                      "resting_heart_rate": 48.0},
-        }
-    sleeps = {
-        # Last night: opens the current cycle at 01:24, wakes 08:54 local.
-        "s-open": _split_sleep("s-open", "2026-07-24T05:24:00.000Z",
-                               "2026-07-24T12:54:00.000Z", 7.5, 79),
-        # The night before last, which is what the header used to show.
-        "s-done": _split_sleep("s-done", "2026-07-23T05:09:00.000Z",
-                               "2026-07-23T10:09:00.000Z", 5.0, 60),
-    }
-    return _FakeSplitClient([OPEN_CYCLE, DONE_CYCLE], recoveries, sleeps)
-
-
-def test_fetch_current_returns_last_nights_sleep_and_this_mornings_recovery(monkeypatch):
-    fake = _split_client()
-    monkeypatch.setattr(whoop, "_authorized_client", lambda: fake)
-
-    rows = whoop.fetch_current()
-
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["date"] == "2026-07-24"          # the wake date, today
-    assert row["recovery_score"] == 79
-    assert row["sleep_hours"] == 7.5
-    assert row["sleep_performance"] == 79
-    assert fake.closed is True
-
-
-def test_fetch_current_omits_the_still_climbing_day_strain(monkeypatch):
-    """Day strain is not final until tonight's bedtime, and upsert_daily_metrics
-    COALESCEs, so a partial number written now would stick."""
-    monkeypatch.setattr(whoop, "_authorized_client", lambda: _split_client())
-
-    row = whoop.fetch_current()[0]
-
-    assert row["strain"] is None
-    # Still recoverable from the stored payload, per the raw-first convention.
-    assert row["raw"]["cycle"]["score"]["strain"] == 3.2
-
-
-def test_fetch_returns_the_completed_cycle_not_the_open_one(monkeypatch):
-    monkeypatch.setattr(whoop, "_authorized_client", lambda: _split_client())
-
-    row = whoop.fetch()[0]
-
-    assert row["date"] == "2026-07-23"
-    assert row["strain"] == 14.2
-
-
-def test_fetch_and_fetch_current_disagree_by_exactly_one_night(monkeypatch):
-    """The regression itself. Both were read off fetch(), so the header showed
-    5.0h/41 from the night before last while the audit showed 7.5h/79."""
-    monkeypatch.setattr(whoop, "_authorized_client", lambda: _split_client())
-
-    current = whoop.fetch_current()[0]
-    completed = whoop.fetch()[0]
-
-    assert (current["sleep_hours"], current["recovery_score"]) == (7.5, 79)
-    assert (completed["sleep_hours"], completed["recovery_score"]) == (5.0, 41)
-    assert current["date"] != completed["date"]
-
-
-def test_fetch_current_empty_when_this_mornings_recovery_is_not_scored_yet(monkeypatch):
-    """Asleep, or the strap has not synced. The briefing omits the header rather
-    than falling back, and --wait-for-wake keeps polling on this."""
-    monkeypatch.setattr(
-        whoop, "_authorized_client", lambda: _split_client(open_recovery_scored=False)
-    )
-
-    assert whoop.fetch_current() == []
-
-
-def test_fetch_current_empty_when_the_newest_cycle_is_already_closed(monkeypatch):
-    """No open cycle in the window at all: WHOOP has not recorded a sleep onset."""
-    fake = _FakeSplitClient([DONE_CYCLE], {}, {})
-    monkeypatch.setattr(whoop, "_authorized_client", lambda: fake)
-
-    assert whoop.fetch_current() == []
-    assert fake.closed is True
-
-
-def test_fetch_current_empty_when_there_are_no_cycles(monkeypatch):
-    fake = _FakeSplitClient([], {}, {})
-    monkeypatch.setattr(whoop, "_authorized_client", lambda: fake)
-
-    assert whoop.fetch_current() == []
-
-
-def test_fetch_current_empty_when_the_only_sleep_did_not_open_the_cycle(monkeypatch):
-    """Skipped rather than returned with blank sleep columns.
-
-    With no sleep the row would fall back to dating itself by the cycle START,
-    which on a pre-midnight bedtime is yesterday: the same date fetch() returns.
-    Both rows would then land on one daily_metrics row and merge, and since
-    upsert COALESCEs with non-null winning and the completed row is written
-    second, this morning's recovery would be replaced by yesterday's.
-    """
-    recoveries = {
-        OPEN_CYCLE["id"]: {
-            "cycle_id": OPEN_CYCLE["id"], "sleep_id": "s-nap", "score_state": "SCORED",
-            "score": {"recovery_score": 79},
-        },
-    }
-    sleeps = {
-        # Ends the same evening, ~15h after the cycle opened: a nap, not last night.
-        "s-nap": _split_sleep("s-nap", "2026-07-24T20:00:00.000Z",
-                              "2026-07-25T00:35:00.000Z", 1.0, 14),
-    }
-    fake = _FakeSplitClient([OPEN_CYCLE, DONE_CYCLE], recoveries, sleeps)
-    monkeypatch.setattr(whoop, "_authorized_client", lambda: fake)
-
-    assert whoop.fetch_current() == []
-
-
-def test_fetch_current_and_fetch_never_return_the_same_date(monkeypatch):
-    """The collision guard, stated directly: two cycles cannot own one waking day."""
-    monkeypatch.setattr(whoop, "_authorized_client", lambda: _split_client())
-
-    current = whoop.fetch_current()
-    completed = whoop.fetch()
-
-    assert current[0]["date"] == "2026-07-24"
-    assert completed[0]["date"] == "2026-07-23"
-
-
-def test_fetch_current_finds_an_open_cycle_that_is_not_first_in_the_list(monkeypatch):
-    """Does not depend on the collection staying newest-first.
-
-    Indexing cycles[0] would return [] here, which is indistinguishable from "not
-    awake yet": --wait-for-wake would poll to its cutoff and ship a briefing with
-    no recovery every morning.
-    """
-    client = _split_client()
-    client._cycles = [DONE_CYCLE, OPEN_CYCLE]  # oldest first
+def _serve(monkeypatch, payload: dict) -> _FakeCycleClient:
+    client = _FakeCycleClient(payload)
     monkeypatch.setattr(whoop, "_authorized_client", lambda: client)
-
-    rows = whoop.fetch_current()
-
-    assert len(rows) == 1
-    assert rows[0]["recovery_score"] == 79
-    assert rows[0]["sleep_hours"] == 7.5
+    return client
 
 
-def test_fetch_current_wraps_oauth_error_as_whoop_auth_error(monkeypatch):
-    fake = _FakeClient(raise_exc=OAuthError("invalid_grant", "token revoked"))
-    monkeypatch.setattr(whoop, "_authorized_client", lambda: fake)
-
-    with pytest.raises(whoop.WhoopAuthError):
-        whoop.fetch_current()
-
-    assert fake.closed is True
+OPEN_ID = 1664667247
+DONE_ID = 1644738825
+OLDER_ID = 1634812900   # also finished and scored, one day further back
 
 
-def test_fetch_current_leaves_request_exception_unchanged(monkeypatch):
-    fake = _FakeClient(raise_exc=requests.ConnectionError("adapter not up yet"))
-    monkeypatch.setattr(whoop, "_authorized_client", lambda: fake)
+def test_fetch_returns_both_cycles_tagged_with_cycle_kind(monkeypatch, payload):
+    """The headline assertion: both cycles come back, correctly tagged.
 
-    with pytest.raises(requests.RequestException):
-        whoop.fetch_current()
+    Returning only the completed one is the original bug, and it was invisible
+    downstream because nothing downstream ever saw a second cycle to compare.
+    """
+    client = _serve(monkeypatch, payload)
+
+    rows = whoop.fetch()
+
+    assert [row["cycle_kind"] for row in rows] == [
+        whoop.CYCLE_CURRENT, whoop.CYCLE_COMPLETED
+    ]
+    # Exactly two rows: the newest completed cycle only, not every scored cycle
+    # in the lookback window.
+    assert [row["cycle_id"] for row in rows] == [OPEN_ID, DONE_ID]
+    assert client.closed is True
+
+
+def test_current_row_holds_last_night_and_this_morning(monkeypatch, payload):
+    _serve(monkeypatch, payload)
+
+    current = whoop.by_kind(whoop.fetch(), whoop.CYCLE_CURRENT)
+
+    assert current["date"] == "2026-07-24"           # the wake date, today
+    assert current["sleep_hours"] == 7.5             # 8h in bed less 30m awake
+    assert current["sleep_performance"] == 79.0
+    assert current["recovery_score"] == 79.0
+    assert current["hrv_ms"] == 70.1183
+    assert current["resting_hr"] == 48.0
+
+
+def test_fetch_completed_row_holds_yesterdays_strain(monkeypatch, payload):
+    _serve(monkeypatch, payload)
+
+    completed = whoop.by_kind(whoop.fetch(), whoop.CYCLE_COMPLETED)
+
+    assert completed["date"] == "2026-07-23"
+    assert completed["strain"] == 14.2361
+
+
+def test_fetch_rows_are_exactly_one_night_apart(monkeypatch, payload):
+    """The regression in one assertion. Both lines used to be read off the
+    completed row, so the header showed 5.0h/41 while the app showed 7.5h/79."""
+    _serve(monkeypatch, payload)
+    rows = whoop.fetch()
+
+    current = whoop.by_kind(rows, whoop.CYCLE_CURRENT)
+    completed = whoop.by_kind(rows, whoop.CYCLE_COMPLETED)
+
+    assert (current["sleep_hours"], current["recovery_score"]) == (7.5, 79.0)
+    assert (completed["sleep_hours"], completed["recovery_score"]) == (5.0, 41.0)
+    assert (
+        date.fromisoformat(current["date"]) - date.fromisoformat(completed["date"])
+    ) == timedelta(days=1)
+
+
+def test_fetch_blanks_the_open_cycles_still_climbing_strain(monkeypatch, payload):
+    """Day strain is not final until tonight's bedtime, and upsert_daily_metrics
+    COALESCEs, so a partial number written now would stick until something
+    non-null replaced it.
+
+    The saved payload has score null on the open cycle, which is what v2 documents
+    for a cycle that is not SCORED. A running score is set here rather than in the
+    fixture because the blanking has to hold whichever shape WHOOP sends.
+    """
+    payload["cycles"][0]["score"] = {"strain": 3.2107, "kilojoule": 4123.6}
+    _serve(monkeypatch, payload)
+
+    current = whoop.by_kind(whoop.fetch(), whoop.CYCLE_CURRENT)
+
+    assert current["strain"] is None
+    # Still recoverable from the stored payload, per the raw-first convention.
+    assert current["raw"]["cycle"]["score"]["strain"] == 3.2107
+
+
+def test_fetch_current_strain_is_none_when_whoop_sends_no_score_at_all(
+    monkeypatch, payload
+):
+    """The documented shape: score is null until score_state is SCORED."""
+    assert payload["cycles"][0]["score"] is None
+    _serve(monkeypatch, payload)
+
+    assert whoop.by_kind(whoop.fetch(), whoop.CYCLE_CURRENT)["strain"] is None
+
+
+def test_fetch_returns_only_the_completed_cycle_before_the_strap_syncs(
+    monkeypatch, payload
+):
+    """Asleep, or awake but not synced: the open cycle has no scored recovery yet.
+
+    --wait-for-wake polls on exactly this and keeps waiting, and the header omits
+    recovery and sleep rather than falling back to the completed cycle.
+    """
+    del payload["recovery_by_cycle"][str(OPEN_ID)]
+    _serve(monkeypatch, payload)
+
+    rows = whoop.fetch()
+
+    assert [row["cycle_kind"] for row in rows] == [whoop.CYCLE_COMPLETED]
+    assert whoop.by_kind(rows, whoop.CYCLE_CURRENT) is None
+
+
+def test_fetch_returns_only_the_current_cycle_when_none_completed_is_scored(
+    monkeypatch, payload
+):
+    """The strap sat on the charger. The header still works; the strain line and
+    TRAINING are what go missing."""
+    del payload["recovery_by_cycle"][str(DONE_ID)]
+    del payload["recovery_by_cycle"][str(OLDER_ID)]
+    _serve(monkeypatch, payload)
+
+    rows = whoop.fetch()
+
+    assert [row["cycle_kind"] for row in rows] == [whoop.CYCLE_CURRENT]
+    assert whoop.by_kind(rows, whoop.CYCLE_COMPLETED) is None
+
+
+def test_fetch_skips_the_open_cycle_when_its_sleep_did_not_open_it(
+    monkeypatch, payload
+):
+    """A nap reached through _sleep_for's fallback is not last night.
+
+    Skipped rather than returned with blank sleep columns: with no sleep the row
+    would date itself by the cycle START, which on a pre-midnight bedtime is the
+    same date the completed row already has, and the two would merge in
+    daily_metrics.
+    """
+    nap_id = payload["recovery_by_cycle"][str(OPEN_ID)]["sleep_id"]
+    nap = payload["sleep_by_id"][nap_id]
+    nap["start"] = "2026-07-24T19:00:00.000Z"   # 14h after the cycle opened
+    nap["end"] = "2026-07-24T21:00:00.000Z"
+    _serve(monkeypatch, payload)
+
+    rows = whoop.fetch()
+
+    assert [row["cycle_kind"] for row in rows] == [whoop.CYCLE_COMPLETED]
+
+
+def test_fetch_does_not_depend_on_the_collection_order(monkeypatch, payload):
+    """Neither selection may trust the endpoint's ordering.
+
+    Taking the open cycle by index would return nothing here, which is
+    indistinguishable from "not awake yet". Taking the completed cycle as the
+    first finished one in list order is the subtler failure: with the list
+    reversed it would pick the OLDER scored cycle, so the strain line would show
+    a two-day-old number and TRAINING would bucket yesterday's workouts on a
+    two-day-old date, silently. Two finished cycles are in the fixture so this
+    test can tell the two apart.
+    """
+    payload["cycles"].reverse()  # oldest first
+    _serve(monkeypatch, payload)
+
+    rows = whoop.fetch()
+
+    assert whoop.by_kind(rows, whoop.CYCLE_CURRENT)["cycle_id"] == OPEN_ID
+    completed = whoop.by_kind(rows, whoop.CYCLE_COMPLETED)
+    assert completed["cycle_id"] == DONE_ID
+    assert completed["date"] == "2026-07-23"
+
+
+def test_fetch_picks_the_newest_completed_cycle_not_merely_a_scored_one(
+    monkeypatch, payload
+):
+    """Yesterday, not any day. The older cycle is equally finished and scored."""
+    _serve(monkeypatch, payload)
+
+    completed = whoop.by_kind(whoop.fetch(), whoop.CYCLE_COMPLETED)
+
+    assert completed["cycle_id"] == DONE_ID
+    assert completed["strain"] == 14.2361
+
+
+def test_fetch_falls_back_to_an_older_cycle_when_the_newest_is_unscored(
+    monkeypatch, payload
+):
+    """A day older is still better than no strain at all, which is why the loop
+    walks past a closed cycle WHOOP never finished scoring."""
+    del payload["recovery_by_cycle"][str(DONE_ID)]
+    _serve(monkeypatch, payload)
+
+    completed = whoop.by_kind(whoop.fetch(), whoop.CYCLE_COMPLETED)
+
+    assert completed["cycle_id"] == OLDER_ID
+    assert completed["date"] == "2026-07-22"
+
+
+def test_fetch_returns_empty_list_when_there_are_no_cycles(monkeypatch, payload):
+    payload["cycles"] = []
+    _serve(monkeypatch, payload)
+
+    assert whoop.fetch() == []
+
+
+def test_by_kind_is_none_for_a_kind_this_fetch_did_not_return():
+    assert whoop.by_kind([], whoop.CYCLE_CURRENT) is None
+    assert whoop.by_kind([{"cycle_kind": "completed"}], whoop.CYCLE_CURRENT) is None
+
+
+def test_storable_leaves_only_daily_metrics_columns(monkeypatch, payload):
+    """The routing keys must not reach db.upsert_daily_metrics, which rejects any
+    field that is not a column so a typo cannot look like a successful write."""
+    _serve(monkeypatch, payload)
+    row = whoop.by_kind(whoop.fetch(), whoop.CYCLE_CURRENT)
+
+    storable = whoop.storable(row)
+
+    assert "cycle_kind" not in storable and "cycle_id" not in storable
+    allowed = {"date", "raw", "raw_json", "fetched_at", *db._METRIC_COLUMNS}
+    assert set(storable) <= allowed
+    # Everything else survives the strip.
+    assert storable["recovery_score"] == 79.0
+    assert storable["date"] == "2026-07-24"
 
 
 # --- _metric_date: the sleep must belong to the cycle -------------------------------

@@ -155,12 +155,13 @@ def _is_main_sleep(metrics: dict) -> bool:
 def wait_for_wake() -> None:
     """Poll WHOOP after an S3 wake until last night's sleep is scored, then deliver.
 
-    Polls whoop.fetch_current(), the cycle in progress, NOT whoop.fetch(). The
-    most recently completed cycle closed when you went to bed and is scored while
-    you are still asleep, so waiting on it fired the briefing in the middle of the
-    night with the previous night's numbers. The open cycle gets a scored recovery
-    and sleep only once you wake and the strap syncs, which is the event this is
-    actually waiting for.
+    Waits on the CURRENT cycle out of whoop.fetch(), never the completed one.
+    The most recently completed cycle closed when you went to bed and is scored
+    while you are still asleep, so waiting on it fired the briefing in the middle
+    of the night with the previous night's numbers. The open cycle only gets a
+    scored recovery and sleep once you wake and the strap syncs, which is the
+    event this is actually waiting for, and fetch() leaves it out of the returned
+    list entirely until then.
 
     Idempotent: if a briefing is already recorded for today, exits without
     sending a second one. Distinguishes "not scored yet" (retry) from "WHOOP
@@ -192,10 +193,10 @@ def wait_for_wake() -> None:
             return
 
         try:
-            items = whoop.fetch_current()
+            current = whoop.by_kind(whoop.fetch(), whoop.CYCLE_CURRENT)
         except whoop.WhoopAuthError:
             # The stored token is dead; WHOOP cannot succeed this run no matter how
-            # long we wait. fetch_current already logged the --auth remediation line.
+            # long we wait. whoop.fetch already logged the --auth remediation line.
             logging.error("WHOOP auth failed during wake wait, delivering without recovery")
             _deliver(note="WHOOP auth failed, recovery unavailable. Run: python -m src.main --auth")
             return
@@ -205,7 +206,7 @@ def wait_for_wake() -> None:
             # misdiagnosed timing problem before.
             logging.warning("WHOOP request failed (will retry): %s", exc)
         else:
-            if items and _is_main_sleep(items[0]):
+            if current is not None and _is_main_sleep(current):
                 logging.info("last night's sleep is scored, delivering briefing")
                 _deliver()
                 return
@@ -228,12 +229,14 @@ def wait_for_wake() -> None:
         time.sleep(nap)
 
 
-# What the briefing takes from each cycle, keyed by whoop.audit()'s briefing_role.
+# What the briefing takes from each cycle, keyed by whoop.audit()'s cycle_kind.
 # Printed per cycle so the current/completed split is verifiable from the table
 # alone, without sending a message and reading it on the phone.
-_BRIEFING_ROLE_LINES = {
-    "current": "briefing: recovery, sleep, HRV, RHR -> header line, sleep note",
-    "completed": "briefing: strain -> Yesterday's Strain, workouts + date -> TRAINING",
+_CYCLE_KIND_LINES = {
+    whoop.CYCLE_CURRENT:
+        "briefing: recovery, sleep, HRV, RHR -> header line, sleep note",
+    whoop.CYCLE_COMPLETED:
+        "briefing: strain -> Yesterday's Strain, workouts + date -> TRAINING",
     None: "briefing: not used",
 }
 
@@ -287,10 +290,10 @@ def whoop_audit() -> int:
             print("      (no workouts)")
         # Both lookups defensive: a row without the key, or with a role this table
         # does not know, prints "not used" instead of taking the table down.
-        role_line = _BRIEFING_ROLE_LINES.get(
-            row.get("briefing_role"), _BRIEFING_ROLE_LINES[None]
+        kind_line = _CYCLE_KIND_LINES.get(
+            row.get("cycle_kind"), _CYCLE_KIND_LINES[None]
         )
-        print(f"    {role_line}")
+        print(f"    {kind_line}")
         print()
     return 0
 

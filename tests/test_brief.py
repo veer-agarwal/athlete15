@@ -92,44 +92,126 @@ def test_session_desc_only_type():
     assert brief._session_desc(session) == "court"
 
 
-# --- _fetch_current / _fetch_metrics persistence ---------------------------------
+# --- _fetch_cycles ----------------------------------------------------------------
+
+
+def _row(kind, cycle_id, **fields):
+    return {"cycle_kind": kind, "cycle_id": cycle_id, **fields}
+
+
+CURRENT_ROW = _row("current", 1664667247, date="2026-07-24", recovery_score=79.0,
+                   sleep_hours=7.5, sleep_performance=79.0, strain=None)
+COMPLETED_ROW = _row("completed", 1644738825, date="2026-07-23", recovery_score=41.0,
+                     sleep_hours=5.0, strain=14.2)
 
 
 @patch("src.brief.db.upsert_daily_metrics")
-@patch("src.brief.whoop.fetch_current")
-def test_fetch_current_stores_the_row_with_a_null_strain(mock_fetch, mock_upsert):
-    """The whole justification for blanking strain on the open cycle.
+@patch("src.brief.whoop.fetch")
+def test_fetch_cycles_splits_the_tagged_rows(mock_fetch, mock_upsert):
+    """Selected by cycle_kind, never by position: which kinds come back varies."""
+    mock_fetch.return_value = [CURRENT_ROW, COMPLETED_ROW]
 
-    upsert_daily_metrics COALESCEs with non-null winning, so a strain written here
-    would sit in daily_metrics until something replaced it. Passing None leaves
-    whatever is already stored alone, and tomorrow's completed-cycle run writes the
-    final number for this date.
-    """
-    row = {"date": "2026-07-24", "recovery_score": 79, "sleep_hours": 7.5,
-           "strain": None}
-    mock_fetch.return_value = [row]
+    current, completed = brief._fetch_cycles()
 
-    assert brief._fetch_current() == row
-    mock_upsert.assert_called_once_with(row)
-    assert mock_upsert.call_args.args[0]["strain"] is None
+    assert current["cycle_id"] == 1664667247
+    assert completed["cycle_id"] == 1644738825
 
 
 @patch("src.brief.db.upsert_daily_metrics")
-@patch("src.brief.whoop.fetch_current", return_value=[])
-def test_fetch_current_stores_nothing_when_nothing_is_scored(mock_fetch, mock_upsert):
-    assert brief._fetch_current() is None
+@patch("src.brief.whoop.fetch")
+def test_fetch_cycles_stores_both_rows_without_the_routing_keys(mock_fetch, mock_upsert):
+    """db.upsert_daily_metrics rejects any field that is not a column, so
+    cycle_kind and cycle_id have to come off before the write."""
+    mock_fetch.return_value = [CURRENT_ROW, COMPLETED_ROW]
+
+    brief._fetch_cycles()
+
+    assert mock_upsert.call_count == 2
+    stored = [call.args[0] for call in mock_upsert.call_args_list]
+    for row in stored:
+        assert "cycle_kind" not in row and "cycle_id" not in row
+    # The open cycle is stored with a null strain, so upsert's COALESCE keeps
+    # whatever is already there rather than freezing a still-climbing number.
+    assert stored[0]["date"] == "2026-07-24" and stored[0]["strain"] is None
+    assert stored[1]["date"] == "2026-07-23" and stored[1]["strain"] == 14.2
+
+
+@patch("src.brief.db.upsert_daily_metrics")
+@patch("src.brief.whoop.fetch", return_value=[COMPLETED_ROW])
+def test_fetch_cycles_current_is_none_before_the_strap_syncs(mock_fetch, mock_upsert):
+    current, completed = brief._fetch_cycles()
+
+    assert current is None
+    assert completed["cycle_id"] == 1644738825
+    mock_upsert.assert_called_once()
+
+
+@patch("src.brief.db.upsert_daily_metrics")
+@patch("src.brief.whoop.fetch", return_value=[])
+def test_fetch_cycles_both_none_when_nothing_is_scored(mock_fetch, mock_upsert):
+    assert brief._fetch_cycles() == (None, None)
     mock_upsert.assert_not_called()
 
 
+@patch("src.brief.whoop.fetch", side_effect=RuntimeError("no whoop token"))
+def test_fetch_cycles_both_none_when_the_fetch_fails(mock_fetch):
+    """A missing token is not retried and must not take the message down."""
+    assert brief._fetch_cycles() == (None, None)
+
+
 @patch("src.brief.db.upsert_daily_metrics", side_effect=RuntimeError("database locked"))
-@patch("src.brief.whoop.fetch_current")
-def test_fetch_current_survives_a_storage_failure(mock_fetch, mock_upsert):
+@patch("src.brief.whoop.fetch")
+def test_fetch_cycles_survives_a_storage_failure(mock_fetch, mock_upsert):
     """The numbers are already in hand; a locked database must not cost the
     message its header."""
-    row = {"date": "2026-07-24", "recovery_score": 79}
-    mock_fetch.return_value = [row]
+    mock_fetch.return_value = [CURRENT_ROW, COMPLETED_ROW]
 
-    assert brief._fetch_current() == row
+    current, completed = brief._fetch_cycles()
+
+    assert current["cycle_id"] == 1664667247
+    assert completed["cycle_id"] == 1644738825
+
+
+# --- _log_field_sources -----------------------------------------------------------
+
+
+def test_log_field_sources_names_a_cycle_id_for_every_field_group(caplog):
+    """The mapping has to be checkable from brief.log alone, without sending a
+    message and reading it on the phone."""
+    with caplog.at_level("INFO"):
+        brief._log_field_sources(CURRENT_ROW, COMPLETED_ROW)
+
+    text = " | ".join(caplog.messages)
+    assert "briefing header" in text and "1664667247" in text
+    assert "Yesterday's Strain" in text and "1644738825" in text
+    assert "TRAINING" in text
+
+
+def test_log_field_sources_says_which_group_is_omitted(caplog):
+    with caplog.at_level("INFO"):
+        brief._log_field_sources(None, COMPLETED_ROW)
+
+    text = " | ".join(caplog.messages)
+    assert "no current cycle, omitted" in text
+    assert "1644738825" in text
+
+
+def test_log_field_sources_warns_when_both_cycles_claim_one_date(caplog):
+    """Two cycles cannot cover the same waking day. Both rows are already written
+    by this point and daily_metrics keys on date, so they have merged."""
+    collided = dict(COMPLETED_ROW, date="2026-07-24")
+    with caplog.at_level("WARNING"):
+        brief._log_field_sources(CURRENT_ROW, collided)
+
+    assert any("merged them" in message for message in caplog.messages)
+
+
+def test_log_field_sources_errors_when_one_cycle_is_tagged_both_ways(caplog):
+    same = dict(COMPLETED_ROW, cycle_id=CURRENT_ROW["cycle_id"])
+    with caplog.at_level("ERROR"):
+        brief._log_field_sources(CURRENT_ROW, same)
+
+    assert any("both current and completed" in m for m in caplog.messages)
 
 
 # --- _metrics_line -------------------------------------------------------------
@@ -796,8 +878,7 @@ def test_today_block_event_without_location_has_no_dash_suffix(mock_fetch):
 
 
 @patch("src.brief._store_yesterday_workouts")
-@patch("src.brief._fetch_current", return_value=None)
-@patch("src.brief._fetch_metrics", return_value=None)
+@patch("src.brief._fetch_cycles", return_value=(None, None))
 @patch("src.brief._news_block", return_value="NEWS\n  - headline one")
 @patch("src.brief._weather_block", return_value="72F, high 84, partly cloudy, 20% precip")
 @patch("src.brief._training_block", return_value="")
@@ -805,7 +886,7 @@ def test_today_block_event_without_location_has_no_dash_suffix(mock_fetch):
 @patch("src.brief._today_block", return_value="")
 def test_build_joins_nonempty_blocks_with_blank_lines(
     mock_today, mock_due, mock_training, mock_weather, mock_news,
-    mock_metrics, mock_current, mock_store,
+    mock_cycles, mock_store,
 ):
     result = brief.build()
     assert result == (
@@ -814,8 +895,7 @@ def test_build_joins_nonempty_blocks_with_blank_lines(
 
 
 @patch("src.brief._store_yesterday_workouts")
-@patch("src.brief._fetch_current", return_value=None)
-@patch("src.brief._fetch_metrics", return_value=None)
+@patch("src.brief._fetch_cycles", return_value=(None, None))
 @patch("src.brief._news_block", return_value="")
 @patch("src.brief._weather_block", return_value="")
 @patch("src.brief._training_block", return_value="")
@@ -823,7 +903,7 @@ def test_build_joins_nonempty_blocks_with_blank_lines(
 @patch("src.brief._today_block", return_value="")
 def test_build_reports_no_data_when_everything_is_empty(
     mock_today, mock_due, mock_training, mock_weather, mock_news,
-    mock_metrics, mock_current, mock_store,
+    mock_cycles, mock_store,
 ):
     assert brief.build() == "no data available this morning"
 
@@ -835,12 +915,13 @@ def test_build_reports_no_data_when_everything_is_empty(
 @patch("src.brief._training_block", return_value="")
 @patch("src.brief._due_block", return_value="")
 @patch("src.brief._today_block", return_value="")
-@patch("src.brief._fetch_current", return_value={"date": "2026-07-24", "recovery_score": 79,
-                                                 "sleep_hours": 7.5, "sleep_performance": 79})
-@patch("src.brief._fetch_metrics", return_value={"date": "2026-07-23", "recovery_score": 41,
-                                                 "sleep_hours": 5.0, "strain": 14.2})
+@patch("src.brief._fetch_cycles", return_value=(
+    {"date": "2026-07-24", "recovery_score": 79, "sleep_hours": 7.5,
+     "sleep_performance": 79},
+    {"date": "2026-07-23", "recovery_score": 41, "sleep_hours": 5.0, "strain": 14.2},
+))
 def test_build_header_reads_current_cycle_and_strain_reads_completed(
-    mock_metrics, mock_current, mock_today, mock_due, mock_training,
+    mock_cycles, mock_today, mock_due, mock_training,
     mock_weather, mock_news, mock_note, mock_store,
 ):
     """End to end through build(): the two cycles land in the two lines they own."""
@@ -857,10 +938,11 @@ def test_build_header_reads_current_cycle_and_strain_reads_completed(
 @patch("src.brief._due_block", return_value="")
 @patch("src.brief._today_block", return_value="")
 @patch("src.brief._training_block", return_value="")
-@patch("src.brief._fetch_current", return_value={"date": "2026-07-24"})
-@patch("src.brief._fetch_metrics", return_value={"date": "2026-07-23"})
+@patch("src.brief._fetch_cycles", return_value=(
+    {"date": "2026-07-24"}, {"date": "2026-07-23"},
+))
 def test_build_passes_the_completed_cycle_date_to_training(
-    mock_metrics, mock_current, mock_training, mock_today, mock_due,
+    mock_cycles, mock_training, mock_today, mock_due,
     mock_weather, mock_news, mock_note, mock_store,
 ):
     """TRAINING buckets on the COMPLETED cycle's date, never the current one.

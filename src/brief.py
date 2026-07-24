@@ -76,25 +76,13 @@ def build() -> str:
     blocks: list[str] = []
 
     # Two WHOOP cycles, not one. `current` is the cycle in progress and carries
-    # last night's sleep and this morning's recovery; `metrics` is the most
-    # recently completed cycle and carries yesterday's day strain and the date
+    # last night's sleep and this morning's recovery; `completed` is the most
+    # recently closed cycle and carries yesterday's day strain and the date
     # TRAINING reads. See _metrics_line for why they cannot be the same row.
-    current = _fetch_current()
-    metrics = _fetch_metrics()
+    current, completed = _fetch_cycles()
 
-    if current is not None and metrics is not None and current["date"] == metrics["date"]:
-        # Two cycles cannot cover the same waking day, so this means one of them
-        # was dated by its cycle start after losing its sleep. Both have already
-        # been written by this point and daily_metrics keys on date, so they have
-        # merged into one row: this is the only trace that happened.
-        logging.warning(
-            "whoop: current and completed cycles both assigned %s, "
-            "daily_metrics merged them",
-            current["date"],
-        )
-
-    if current is not None or metrics is not None:
-        blocks.append(_guard("metrics line", lambda: _metrics_line(current, metrics)))
+    if current is not None or completed is not None:
+        blocks.append(_guard("metrics line", lambda: _metrics_line(current, completed)))
     if current is not None:
         blocks.append(_guard("sleep note", lambda: _sleep_note(current)))
 
@@ -103,9 +91,9 @@ def build() -> str:
     _store_yesterday_workouts()
 
     # "Yesterday" for TRAINING is the completed cycle's assigned date, taken from
-    # the WHOOP metrics rather than calendar arithmetic. None when WHOOP is down,
+    # the WHOOP row rather than calendar arithmetic. None when WHOOP is down,
     # in which case _training_block falls back to calendar yesterday.
-    cycle_date = metrics["date"] if metrics is not None else None
+    cycle_date = completed["date"] if completed is not None else None
 
     blocks.append(_guard("TODAY", _today_block))
     blocks.append(_guard("DUE", _due_block))
@@ -182,59 +170,104 @@ def _fetch_with_retry(
     raise AssertionError("unreachable")  # the loop always returns or raises
 
 
-def _fetch_metrics() -> dict | None:
-    """The most recent COMPLETED WHOOP cycle, stored to daily_metrics on the way.
+def _fetch_cycles() -> tuple[dict | None, dict | None]:
+    """Both WHOOP cycles as (current, completed), stored to daily_metrics on the way.
 
-    Yesterday. Supplies day strain and the date TRAINING buckets on, not the
-    header's recovery and sleep; _fetch_current gets those.
+    One call, one tagged list, selected by cycle_kind rather than by position:
+    whoop.fetch() returns the open cycle, the last completed one, or only one of
+    them, depending on what WHOOP has scored. Either being None is a normal
+    morning, not a failure. A missing current cycle means the strap has not synced
+    since you woke; the header then omits recovery and sleep rather than falling
+    back to the completed cycle, because that fallback IS the stale-by-one-night
+    bug.
 
-    This and _fetch_current are the only fetches that persist what they got. WHOOP
-    is the source the briefing trends over, and the round trip has already been
-    paid for here. The write cannot take the section down with it: the numbers are
-    already in hand, and a locked database is not a reason to drop them from the
-    message.
+    This is the only fetch that persists what it got. WHOOP is the source the
+    briefing trends over and the round trip has already been paid for here. The
+    write cannot take the section down with it: the numbers are already in hand,
+    and a locked database is not a reason to drop them from the message.
     """
-    return _fetch_whoop_row("whoop", whoop.fetch)
-
-
-def _fetch_current() -> dict | None:
-    """The WHOOP cycle in progress: last night's sleep, this morning's recovery.
-
-    None before the strap syncs after you wake, which is the normal state of a
-    briefing built too early rather than a failure. The header then omits recovery
-    and sleep rather than falling back to the completed cycle, because that
-    fallback is the bug this split exists to fix: it printed the night before last
-    under today's date with nothing marking it as stale.
-    """
-    return _fetch_whoop_row("whoop current", whoop.fetch_current)
-
-
-def _fetch_whoop_row(
-    name: str, fetch: Callable[[], list[dict]]
-) -> dict | None:
-    """One WHOOP row, retried, stored, and degraded to None on any failure."""
     try:
-        # RuntimeError, which is what the WHOOP fetches raise for a missing token,
-        # is deliberately not in the retry set. An absent whoop_token.json does not
+        # RuntimeError, which is what fetch() raises for a missing token, is
+        # deliberately not in the retry set. An absent whoop_token.json does not
         # resolve itself in ten seconds.
-        items = _fetch_with_retry(name, fetch, requests.RequestException)
+        rows = _fetch_with_retry("whoop", whoop.fetch, requests.RequestException)
     except Exception as exc:
-        logging.warning("%s unavailable, those fields omitted: %s", name, exc)
-        return None
+        logging.warning("whoop unavailable, recovery/sleep/strain omitted: %s", exc)
+        return None, None
 
-    if not items:
-        # Expected before the strap syncs after you wake, not a failure.
-        logging.info("%s: nothing scored yet, those fields omitted", name)
-        return None
+    current = whoop.by_kind(rows, whoop.CYCLE_CURRENT)
+    completed = whoop.by_kind(rows, whoop.CYCLE_COMPLETED)
 
-    metrics = items[0]
-    try:
-        db.upsert_daily_metrics(metrics)
-        logging.info("%s stored for %s", name, metrics["date"])
-    except Exception:
-        logging.exception("storing %s failed, briefing continues", name)
+    for row in (current, completed):
+        if row is None:
+            continue
+        try:
+            # storable() drops cycle_kind and cycle_id, which are routing keys
+            # rather than columns; upsert_daily_metrics rejects unknown fields.
+            db.upsert_daily_metrics(whoop.storable(row))
+            logging.info(
+                "whoop %s cycle %s stored for %s",
+                row[whoop.CYCLE_KIND], row[whoop.CYCLE_ID], row["date"],
+            )
+        except Exception:
+            logging.exception("storing whoop metrics failed, briefing continues")
 
-    return metrics
+    _log_field_sources(current, completed)
+    return current, completed
+
+
+def _log_field_sources(current: dict | None, completed: dict | None) -> None:
+    """Name the cycle behind every WHOOP field the briefing prints.
+
+    The point is that the current/completed split is checkable from brief.log
+    alone, without sending a message and reading it on the phone. Every line names
+    the field group, the cycle id, and the date that cycle was assigned, so a field
+    printed off the wrong cycle is visible here before anyone notices the number
+    looks stale.
+    """
+    if current is not None:
+        logging.info(
+            "briefing header (sleep, sleep performance, recovery, HRV, RHR) "
+            "<- cycle %s [%s] date %s",
+            current[whoop.CYCLE_ID], current[whoop.CYCLE_KIND], current["date"],
+        )
+    else:
+        logging.info(
+            "briefing header (sleep, recovery, HRV, RHR) <- no current cycle, omitted"
+        )
+
+    if completed is not None:
+        logging.info(
+            "briefing Yesterday's Strain <- cycle %s [%s] date %s",
+            completed[whoop.CYCLE_ID], completed[whoop.CYCLE_KIND], completed["date"],
+        )
+        logging.info(
+            "briefing TRAINING (workouts, load date) <- cycle %s [%s] date %s",
+            completed[whoop.CYCLE_ID], completed[whoop.CYCLE_KIND], completed["date"],
+        )
+    else:
+        logging.info(
+            "briefing Yesterday's Strain and TRAINING <- no completed cycle, "
+            "TRAINING falls back to calendar yesterday"
+        )
+
+    if current is not None and completed is not None:
+        if current[whoop.CYCLE_ID] == completed[whoop.CYCLE_ID]:
+            # Would mean one cycle is feeding both the header and the strain line,
+            # which is the exact bug this split removed.
+            logging.error(
+                "whoop: cycle %s tagged as both current and completed",
+                current[whoop.CYCLE_ID],
+            )
+        elif current["date"] == completed["date"]:
+            # Two cycles cannot cover the same waking day. Both rows have already
+            # been written and daily_metrics keys on date, so they have merged into
+            # one row: this line is the only trace that happened.
+            logging.warning(
+                "whoop: current cycle %s and completed cycle %s both assigned %s, "
+                "daily_metrics merged them",
+                current[whoop.CYCLE_ID], completed[whoop.CYCLE_ID], current["date"],
+            )
 
 
 def _store_yesterday_workouts() -> None:
@@ -242,7 +275,7 @@ def _store_yesterday_workouts() -> None:
 
     fetch_workouts defaults to a trailing seven-day window, which covers
     yesterday and lets a workout WHOOP scored late still land. Kept separate
-    from _fetch_metrics because workouts come from a different endpoint: one
+    from _fetch_cycles because workouts come from a different endpoint: one
     failing must not cost the other. Best effort, never raises into build().
 
     A WhoopAuthError (dead token) is not in the retry set, so it surfaces here

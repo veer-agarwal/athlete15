@@ -114,6 +114,15 @@ def test_wait_for_network_gives_up_after_cap_without_looping_forever(monkeypatch
     mock_sleep.assert_called_once_with(main.NETWORK_PROBE_INTERVAL_SECONDS)
 
 
+def _current(fields: dict) -> dict:
+    """A fetch() row tagged as the cycle in progress.
+
+    wait_for_wake selects on cycle_kind, never on list position, so every fake
+    row has to carry the tag.
+    """
+    return {"cycle_kind": main.whoop.CYCLE_CURRENT, "cycle_id": 1664667247, **fields}
+
+
 # --- wait_for_wake -----------------------------------------------------------------
 
 
@@ -124,7 +133,7 @@ def test_wait_for_wake_idempotent_when_brief_already_recorded(monkeypatch):
     mock_deliver = MagicMock()
     monkeypatch.setattr(main, "_deliver", mock_deliver)
     mock_fetch = MagicMock()
-    monkeypatch.setattr(main.whoop, "fetch_current", mock_fetch)
+    monkeypatch.setattr(main.whoop, "fetch", mock_fetch)
 
     main.wait_for_wake()
 
@@ -133,28 +142,39 @@ def test_wait_for_wake_idempotent_when_brief_already_recorded(monkeypatch):
     mock_fetch.assert_not_called()
 
 
-def test_wait_for_wake_polls_the_current_cycle_not_the_completed_one(monkeypatch):
-    """The wake trigger keys on the cycle in progress.
+def test_wait_for_wake_ignores_a_completed_cycle_with_a_full_nights_sleep(monkeypatch):
+    """The wake trigger keys on the CURRENT cycle only.
 
     The most recently completed cycle closes at bedtime and is scored while you
-    are still asleep, so polling whoop.fetch() would fire the briefing in the
-    middle of the night carrying the previous night's numbers.
+    are still asleep, and it carries a full night of sleep: the night before last.
+    Delivering on it fired the briefing in the middle of the night with the
+    previous night's numbers. Here fetch() returns only that cycle, exactly as it
+    does before the strap syncs, and the loop must keep waiting.
     """
     fixed_now = datetime(2026, 7, 24, 7, 5, tzinfo=NY)
     monkeypatch.setattr(main, "datetime", _FixedDatetime(fixed_now))
     monkeypatch.setattr(main.db, "brief_exists", MagicMock(return_value=False))
     monkeypatch.setattr(main, "_wait_for_network", MagicMock(return_value=0.0))
-    monkeypatch.setattr(main, "_deliver", MagicMock())
-    monkeypatch.setattr(main.time, "sleep", MagicMock())
-    mock_completed = MagicMock(return_value=[{"sleep_hours": 7.0}])
-    monkeypatch.setattr(main.whoop, "fetch", mock_completed)
-    monkeypatch.setattr(
-        main.whoop, "fetch_current", MagicMock(return_value=[{"sleep_hours": 7.5}])
-    )
+    mock_deliver = MagicMock()
+    monkeypatch.setattr(main, "_deliver", mock_deliver)
+    mock_sleep = MagicMock()
+    monkeypatch.setattr(main.time, "sleep", mock_sleep)
+    completed_only = [{
+        "cycle_kind": main.whoop.CYCLE_COMPLETED,
+        "cycle_id": 1644738825,
+        "sleep_hours": 7.0,
+    }]
+    # side_effect so the second poll ends the loop instead of spinning forever.
+    monkeypatch.setattr(main.whoop, "fetch", MagicMock(side_effect=[
+        completed_only,
+        completed_only + [_current({"sleep_hours": 7.5})],
+    ]))
 
     main.wait_for_wake()
 
-    mock_completed.assert_not_called()
+    # Waited a round rather than delivering on the completed cycle.
+    assert mock_sleep.call_count == 1
+    mock_deliver.assert_called_once_with()
 
 
 def test_wait_for_wake_delivers_immediately_on_completed_main_sleep(monkeypatch):
@@ -166,7 +186,7 @@ def test_wait_for_wake_delivers_immediately_on_completed_main_sleep(monkeypatch)
     monkeypatch.setattr(main, "_deliver", mock_deliver)
     mock_sleep = MagicMock()
     monkeypatch.setattr(main.time, "sleep", mock_sleep)
-    monkeypatch.setattr(main.whoop, "fetch_current", MagicMock(return_value=[{"sleep_hours": 7.0}]))
+    monkeypatch.setattr(main.whoop, "fetch", MagicMock(return_value=[_current({"sleep_hours": 7.0})]))
 
     main.wait_for_wake()
 
@@ -186,10 +206,10 @@ def test_wait_for_wake_naps_then_delivers_on_later_main_sleep(monkeypatch):
     mock_sleep = MagicMock()
     monkeypatch.setattr(main.time, "sleep", mock_sleep)
     mock_fetch = MagicMock(side_effect=[
-        [{"sleep_hours": 1.0}],  # nap: does not deliver
-        [{"sleep_hours": 7.0}],  # real main sleep: delivers
+        [_current({"sleep_hours": 1.0})],  # nap: does not deliver
+        [_current({"sleep_hours": 7.0})],  # real main sleep: delivers
     ])
-    monkeypatch.setattr(main.whoop, "fetch_current", mock_fetch)
+    monkeypatch.setattr(main.whoop, "fetch", mock_fetch)
 
     main.wait_for_wake()
 
@@ -208,7 +228,7 @@ def test_wait_for_wake_auth_failure_delivers_once_with_note_no_retry(monkeypatch
     mock_sleep = MagicMock()
     monkeypatch.setattr(main.time, "sleep", mock_sleep)
     monkeypatch.setattr(
-        main.whoop, "fetch_current", MagicMock(side_effect=main.whoop.WhoopAuthError("dead token"))
+        main.whoop, "fetch", MagicMock(side_effect=main.whoop.WhoopAuthError("dead token"))
     )
 
     main.wait_for_wake()
@@ -230,7 +250,7 @@ def test_wait_for_wake_past_cutoff_with_no_completed_cycle_delivers_with_note(mo
     monkeypatch.setattr(main, "_deliver", mock_deliver)
     mock_sleep = MagicMock()
     monkeypatch.setattr(main.time, "sleep", mock_sleep)
-    monkeypatch.setattr(main.whoop, "fetch_current", MagicMock(return_value=[]))
+    monkeypatch.setattr(main.whoop, "fetch", MagicMock(return_value=[]))
 
     main.wait_for_wake()
 
@@ -258,7 +278,7 @@ def test_whoop_audit_prints_table_and_returns_zero(monkeypatch, capsys):
             "recovery_score": 60,
             "sleep_hours": 8.0,
             "sleep_performance": 90,
-            "briefing_role": "completed",
+            "cycle_kind": "completed",
             "workouts": [{"sport": "volleyball", "duration_min": 90, "strain": 12.0}],
         },
         {
@@ -270,7 +290,7 @@ def test_whoop_audit_prints_table_and_returns_zero(monkeypatch, capsys):
             "recovery_score": 70,
             "sleep_hours": 7.0,
             "sleep_performance": 85,
-            "briefing_role": "current",
+            "cycle_kind": "current",
             "workouts": [],
         },
     ]
@@ -296,18 +316,18 @@ def test_whoop_audit_prints_the_briefing_field_mapping_per_cycle(monkeypatch, ca
         {
             "date": "2026-07-24", "cycle_id": "open", "start_local": "2026-07-24 01:24",
             "end_local": "-", "strain": None, "recovery_score": 79, "sleep_hours": 7.5,
-            "sleep_performance": 79, "briefing_role": "current", "workouts": [],
+            "sleep_performance": 79, "cycle_kind": "current", "workouts": [],
         },
         {
             "date": "2026-07-23", "cycle_id": "done", "start_local": "2026-07-23 01:09",
             "end_local": "2026-07-24 01:24", "strain": 14.2, "recovery_score": 41,
-            "sleep_hours": 5.0, "sleep_performance": 60, "briefing_role": "completed",
+            "sleep_hours": 5.0, "sleep_performance": 60, "cycle_kind": "completed",
             "workouts": [],
         },
         {
             "date": "2026-07-22", "cycle_id": "older", "start_local": "2026-07-22 00:30",
             "end_local": "2026-07-23 01:09", "strain": 9.0, "recovery_score": 55,
-            "sleep_hours": 6.0, "sleep_performance": 70, "briefing_role": None,
+            "sleep_hours": 6.0, "sleep_performance": 70, "cycle_kind": None,
             "workouts": [],
         },
     ]
@@ -323,7 +343,7 @@ def test_whoop_audit_prints_the_briefing_field_mapping_per_cycle(monkeypatch, ca
     assert briefing[2] == "briefing: not used"
 
 
-def test_whoop_audit_row_without_a_briefing_role_key_still_prints(monkeypatch, capsys):
+def test_whoop_audit_row_without_a_cycle_kind_key_still_prints(monkeypatch, capsys):
     """A row from an older audit shape must not take the table down."""
     rows = [{
         "date": "2026-07-23", "cycle_id": "c1", "start_local": "2026-07-22 19:00",
