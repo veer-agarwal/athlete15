@@ -37,6 +37,7 @@ section, not kill the whole message. The log says what was omitted and why.
 The briefing REPORTS. It does not coach. No training recommendations.
 """
 
+import json
 import logging
 import time
 from collections.abc import Callable
@@ -49,11 +50,13 @@ from src import config, db, llm, training
 from src.sources import calendar, weather, news, notion, whoop
 
 # Retry policy for source fetches. The failure being handled is a network adapter
-# that has not associated yet after an S3 wake, so backoff is fixed rather than
-# exponential: the condition clears on a wall clock timescale of seconds, and
-# there is no server being overloaded to back off from.
+# that has not associated yet after an S3 wake. The wake job now runs a network
+# probe before building, so by the time these fetches run the adapter is usually
+# up; this is the backstop for the case where a single host is still settling.
+# 15s then 30s matches the WHOOP and Notion client backoffs and gives a cold
+# connection real time rather than hammering it twice in 20 seconds.
 FETCH_ATTEMPTS = 3
-RETRY_BACKOFF_SECONDS = 10
+RETRY_BACKOFF_SECONDS = (15, 30)
 
 # Cap on DUE lines so the section cannot eat the message. Six covers a heavy
 # week; past that the count line says what was cut.
@@ -79,9 +82,18 @@ def build() -> str:
         blocks.append(_guard("metrics line", lambda: _metrics_line(metrics)))
         blocks.append(_guard("sleep note", lambda: _sleep_note(metrics)))
 
+    # Persist WHOOP workouts before the TRAINING block reads them below. Best
+    # effort and self-contained: it renders nothing itself and never raises.
+    _store_yesterday_workouts()
+
+    # "Yesterday" for TRAINING is the completed cycle's assigned date, taken from
+    # the WHOOP metrics rather than calendar arithmetic. None when WHOOP is down,
+    # in which case _training_block falls back to calendar yesterday.
+    cycle_date = metrics["date"] if metrics is not None else None
+
     blocks.append(_guard("TODAY", _today_block))
     blocks.append(_guard("DUE", _due_block))
-    blocks.append(_guard("TRAINING", _training_block))
+    blocks.append(_guard("TRAINING", lambda: _training_block(cycle_date)))
     blocks.append(_guard("weather", _weather_block))
     blocks.append(_guard("NEWS", _news_block))
 
@@ -125,8 +137,8 @@ def _fetch_with_retry(
 
     Re-raises the last exception once attempts are exhausted, leaving the caller
     to decide how the section degrades. Anything not in retry_on propagates
-    immediately: a KeyError from our own parsing will not be sitting out three
-    ten second sleeps before it surfaces.
+    immediately: a KeyError from our own parsing will not be sitting out the
+    retry backoffs before it surfaces.
     """
     for attempt in range(1, FETCH_ATTEMPTS + 1):
         try:
@@ -137,11 +149,16 @@ def _fetch_with_retry(
                     "%s failed after %d attempts: %s", name, FETCH_ATTEMPTS, exc
                 )
                 raise
+            # Clamp so a shorter schedule than the attempt count reuses its last
+            # value rather than running off the end.
+            wait = RETRY_BACKOFF_SECONDS[
+                min(attempt, len(RETRY_BACKOFF_SECONDS)) - 1
+            ]
             logging.warning(
                 "%s attempt %d/%d failed: %s, retrying in %ds",
-                name, attempt, FETCH_ATTEMPTS, exc, RETRY_BACKOFF_SECONDS,
+                name, attempt, FETCH_ATTEMPTS, exc, wait,
             )
-            time.sleep(RETRY_BACKOFF_SECONDS)
+            time.sleep(wait)
         else:
             logging.info("%s ok on attempt %d, %d item(s)", name, attempt, len(items))
             return items
@@ -181,16 +198,49 @@ def _fetch_metrics() -> dict | None:
     return metrics
 
 
+def _store_yesterday_workouts() -> None:
+    """Fetch and persist recent WHOOP workouts so TRAINING can show them.
+
+    fetch_workouts defaults to a trailing seven-day window, which covers
+    yesterday and lets a workout WHOOP scored late still land. Kept separate
+    from _fetch_metrics because workouts come from a different endpoint: one
+    failing must not cost the other. Best effort, never raises into build().
+
+    A WhoopAuthError (dead token) is not in the retry set, so it surfaces here
+    on the first attempt and is logged once rather than retried three times.
+    """
+    try:
+        workouts = _fetch_with_retry(
+            "whoop workouts", whoop.fetch_workouts, requests.RequestException
+        )
+    except Exception as exc:
+        logging.warning("whoop workouts unavailable, TRAINING may omit them: %s", exc)
+        return
+
+    try:
+        whoop.store_workouts(workouts)
+    except Exception:
+        logging.exception("storing whoop workouts failed, briefing continues")
+
+
 # ----------------------------------------------------------------------------------
 # blocks, in layout order
 
 
 def _metrics_line(metrics: dict) -> str:
-    """Recovery 54  |  Sleep 6h12m (71%)  |  HRV 62  |  RHR 51
+    """The recovery header, plus a second strain line:
+
+        Recovery 54  |  Sleep 6h12m (71%)  |  HRV 62  |  RHR 51
+        Yesterday's Strain 14.2
 
     Fields WHOOP did not score are dropped rather than printed as a dash, so a
     partial day stays readable. Explicit :.0f throughout because WHOOP sends
     whole numbers as floats and would otherwise print "Recovery 54.0".
+
+    Day strain is the cycle score (metrics['strain'], set from cycle.score.strain
+    in whoop._row), NOT a sum of the day's workout strains. Those are different
+    numbers and the cycle score is the one the WHOOP app displays. It sits on its
+    own line because it summarizes yesterday's whole day, not last night.
     """
     parts = []
     if metrics.get("recovery_score") is not None:
@@ -204,7 +254,11 @@ def _metrics_line(metrics: dict) -> str:
         parts.append(f"HRV {metrics['hrv_ms']:.0f}")
     if metrics.get("resting_hr") is not None:
         parts.append(f"RHR {metrics['resting_hr']:.0f}")
-    return "  |  ".join(parts)
+
+    lines = ["  |  ".join(parts)] if parts else []
+    if metrics.get("strain") is not None:
+        lines.append(f"Yesterday's Strain {metrics['strain']:.1f}")
+    return "\n".join(lines)
 
 
 def _sleep_note(metrics: dict) -> str:
@@ -332,8 +386,16 @@ def _due_block() -> str:
     return "\n".join(lines)
 
 
-def _training_block() -> str:
+def _training_block(cycle_date: str | None = None) -> str:
     """TRAINING section: yesterday, load, active injuries. All local data.
+
+    "Yesterday" is the most recently COMPLETED WHOOP cycle, whose assigned local
+    date (cycle_date) comes from the cycle's own sleep-end via whoop._metric_date,
+    NOT calendar arithmetic. This matters because the job runs at 11:00 UTC, which
+    is still the previous UTC day for the first hours of the morning, so naive UTC
+    date math would be off by one; and because a missed strap sync means the last
+    completed cycle is not simply "today minus one". Calendar yesterday is only the
+    fallback for when WHOOP is unavailable and no cycle date was passed.
 
     Rendered here rather than reusing training.format_training_block(), which
     keeps its own looser format for the /status bot command. Load is stated as
@@ -342,28 +404,30 @@ def _training_block() -> str:
     """
     try:
         today = datetime.now(ZoneInfo(config.TIMEZONE)).date()
-        yesterday = (today - timedelta(days=1)).isoformat()
-        logged = training.sessions_between(yesterday, yesterday)
+        target = cycle_date or (today - timedelta(days=1)).isoformat()
+        logged = training.sessions_between(target, target)
+        workouts = db.whoop_workouts_between(target, target)
         load = training.acute_chronic_ratio()
         injuries = training.active_injuries()
     except Exception:
         logging.exception("training queries failed, TRAINING omitted")
         return ""
 
-    # "No data" for this section: nothing yesterday, no load in 28 days, and no
-    # open injuries. A session logged without RPE inside the window contributes
-    # zero load and can slip past this test; that is acceptable for a section
-    # whose job is current status, and /status still shows everything.
-    if not logged and not injuries and not load["acute"] and not load["chronic"]:
+    # "No data" for this section: nothing on the target date (neither hand-logged
+    # nor WHOOP-measured), no load in 28 days, and no open injuries. A session
+    # logged without RPE inside the window contributes zero load and can slip past
+    # this test; that is acceptable for a section whose job is current status, and
+    # /status still shows everything.
+    if (
+        not logged
+        and not workouts
+        and not injuries
+        and not load["acute"]
+        and not load["chronic"]
+    ):
         return ""
 
-    lines = ["TRAINING"]
-    if logged:
-        # One line even for two-a-days; repeated "Yesterday:" labels read as a bug.
-        lines.append("  Yesterday: " + "; ".join(_session_desc(s) for s in logged))
-    else:
-        lines.append("  Yesterday: nothing logged")
-
+    lines = ["TRAINING", _yesterday_line(workouts, logged)]
     lines.append(f"  7d load {load['acute']:.0f}, 28d avg {load['chronic']:.0f}")
 
     for injury in injuries:
@@ -451,3 +515,88 @@ def _session_desc(session: dict) -> str:
     if session.get("rpe") is not None:
         parts.append(f"RPE {session['rpe']}")
     return " ".join(parts)
+
+
+def _yesterday_line(workouts: list[dict], sessions: list[dict]) -> str:
+    """The 'Yesterday:' line for TRAINING.
+
+    Leads with the single LONGEST WHOOP workout of the completed cycle, with a
+    count of the rest ("(+2 other activities)") rather than dropping them
+    silently, and pairs it with the RPE logged for that date. Two different
+    measurements of the day on one line: WHOOP's objective sport/duration/strain
+    and the subjective RPE. RPE shows as a number when one was logged, else
+    "RPE not logged", because strain systematically undervalues resistance work
+    and a session with no RPE is a gap worth naming rather than hiding.
+
+    Falls back to the hand-logged session line when WHOOP recorded nothing, and
+    to "nothing logged" when neither source has anything.
+    """
+    date_rpe = _date_rpe(sessions)
+
+    if workouts:
+        longest = max(workouts, key=lambda w: w.get("duration_min") or 0)
+        others = len(workouts) - 1
+
+        strain_part = (
+            f", strain {longest['strain']:.1f}"
+            if longest.get("strain") is not None
+            else ""
+        )
+        rpe_part = f"RPE {date_rpe:g}" if date_rpe is not None else "RPE not logged"
+        if others > 0:
+            noun = "activity" if others == 1 else "activities"
+            others_part = f" (+{others} other {noun})"
+        else:
+            others_part = ""
+
+        return (
+            f"  Yesterday: {_workout_sport(longest)} "
+            f"{_fmt_workout_dur(longest.get('duration_min'))}"
+            f"{strain_part}, {rpe_part}{others_part}"
+        )
+
+    if sessions:
+        # No WHOOP workout, but something was typed in. One line even for
+        # two-a-days; repeated "Yesterday:" labels read as a bug.
+        return "  Yesterday: " + "; ".join(_session_desc(s) for s in sessions)
+
+    return "  Yesterday: nothing logged"
+
+
+def _date_rpe(sessions: list[dict]) -> int | float | None:
+    """The RPE logged for the date, or None. Max when several sessions carry one.
+
+    A two-a-day produces two sessions; the higher RPE is the more conservative
+    read of how hard the day was, and it is a single deterministic value to show.
+    """
+    rpes = [s["rpe"] for s in sessions if s.get("rpe") is not None]
+    return max(rpes) if rpes else None
+
+
+def _workout_sport(workout: dict) -> str:
+    """WHOOP's own label for a workout, capitalized, e.g. 'Volleyball'.
+
+    Prefers the stored sport_name column, falls back to the raw payload (rows
+    stored before that column existed keep it in raw_json), then to the sport id,
+    so a workout is never labeled blank.
+    """
+    name = workout.get("sport_name")
+    if not name:
+        raw = workout.get("raw_json")
+        if raw:
+            try:
+                name = json.loads(raw).get("sport_name")
+            except (ValueError, TypeError):
+                name = None
+    if not name:
+        sport_id = workout.get("sport_id")
+        return f"Sport {sport_id}" if sport_id is not None else "Workout"
+    return name.capitalize()
+
+
+def _fmt_workout_dur(minutes: int | None) -> str:
+    """WHOOP workout minutes -> '2h05m', or '54m' under an hour, '?' if missing."""
+    if minutes is None:
+        return "?"
+    hours, mins = divmod(minutes, 60)
+    return f"{hours}h{mins:02d}m" if hours else f"{mins}m"

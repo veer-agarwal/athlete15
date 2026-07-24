@@ -6,6 +6,7 @@ external source (db, training, notion, llm) has that call mocked.
 Run with:  pytest tests/test_brief.py
 """
 
+import json
 from datetime import date, datetime, timedelta
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -125,6 +126,34 @@ def test_metrics_line_all_missing_is_empty():
 
 def test_metrics_line_empty_dict_is_empty():
     assert brief._metrics_line({}) == ""
+
+
+def test_metrics_line_with_strain_adds_second_exact_line():
+    metrics = {
+        "recovery_score": 54, "sleep_hours": None, "hrv_ms": None, "resting_hr": None,
+        "strain": 14.6,
+    }
+    result = brief._metrics_line(metrics)
+    lines = result.split("\n")
+    assert len(lines) == 2
+    assert lines[0] == "Recovery 54"
+    assert lines[1] == "Yesterday's Strain 14.6"
+
+
+def test_metrics_line_strain_none_omits_second_line():
+    metrics = {
+        "recovery_score": 54, "sleep_hours": None, "hrv_ms": None, "resting_hr": None,
+        "strain": None,
+    }
+    assert brief._metrics_line(metrics) == "Recovery 54"
+
+
+def test_metrics_line_only_strain_present_no_recovery_line():
+    metrics = {
+        "recovery_score": None, "sleep_hours": None, "hrv_ms": None, "resting_hr": None,
+        "strain": 9.2,
+    }
+    assert brief._metrics_line(metrics) == "Yesterday's Strain 9.2"
 
 
 # --- _sleep_note -----------------------------------------------------------------
@@ -287,19 +316,23 @@ def test_due_block_survives_storage_failure(mock_fetch, mock_upsert):
 # --- _training_block ---------------------------------------------------------------
 
 
+@patch("src.brief.db.whoop_workouts_between", return_value=[])
 @patch("src.brief.training.active_injuries", return_value=[])
 @patch("src.brief.training.acute_chronic_ratio")
 @patch("src.brief.training.sessions_between", return_value=[])
-def test_training_block_empty_when_nothing_at_all(mock_sessions, mock_load, mock_injuries):
+def test_training_block_empty_when_nothing_at_all(
+    mock_sessions, mock_load, mock_injuries, mock_workouts
+):
     mock_load.return_value = {"acute": 0.0, "chronic": 0.0, "ratio": None}
     assert brief._training_block() == ""
 
 
+@patch("src.brief.db.whoop_workouts_between", return_value=[])
 @patch("src.brief.training.active_injuries")
 @patch("src.brief.training.acute_chronic_ratio")
 @patch("src.brief.training.sessions_between", return_value=[])
 def test_training_block_nothing_logged_line_when_injuries_present(
-    mock_sessions, mock_load, mock_injuries
+    mock_sessions, mock_load, mock_injuries, mock_workouts
 ):
     mock_load.return_value = {"acute": 0.0, "chronic": 0.0, "ratio": None}
     mock_injuries.return_value = [{
@@ -310,10 +343,13 @@ def test_training_block_nothing_logged_line_when_injuries_present(
     assert "  Yesterday: nothing logged" in result
 
 
+@patch("src.brief.db.whoop_workouts_between", return_value=[])
 @patch("src.brief.training.active_injuries", return_value=[])
 @patch("src.brief.training.acute_chronic_ratio")
 @patch("src.brief.training.sessions_between")
-def test_training_block_renders_session_and_load(mock_sessions, mock_load, mock_injuries):
+def test_training_block_renders_session_and_load(
+    mock_sessions, mock_load, mock_injuries, mock_workouts
+):
     mock_sessions.return_value = [{"type": "court", "duration_min": 90, "rpe": 6}]
     mock_load.return_value = {"acute": 1840.0, "chronic": 1610.0, "ratio": 1.14}
     result = brief._training_block()
@@ -358,6 +394,284 @@ def test_training_block_injury_with_no_pain_logged(mock_sessions, mock_load):
 @patch("src.brief.training.sessions_between", side_effect=RuntimeError("db locked"))
 def test_training_block_empty_when_query_raises(mock_sessions):
     assert brief._training_block() == ""
+
+
+# --- _training_block: WHOOP-measured workouts ---------------------------------
+#
+# _training_block also calls db.whoop_workouts_between(yesterday, yesterday) and
+# folds the result into the single "Yesterday: ..." line built by
+# brief._yesterday_line (see the dedicated tests for that function below), rather
+# than rendering a separate WHOOP list. These tests mock that call directly
+# rather than hitting the real database.
+
+
+@patch("src.brief.training.active_injuries", return_value=[])
+@patch("src.brief.training.acute_chronic_ratio")
+@patch("src.brief.db.whoop_workouts_between")
+@patch("src.brief.training.sessions_between", return_value=[])
+def test_training_block_workouts_present_suppresses_nothing_logged(
+    mock_sessions, mock_workouts, mock_load, mock_injuries
+):
+    mock_workouts.return_value = [
+        {"duration_min": 88, "strain": 12.3, "sport_name": "lifting"},
+    ]
+    mock_load.return_value = {"acute": 0.0, "chronic": 0.0, "ratio": None}
+    result = brief._training_block()
+    assert "nothing logged" not in result
+    assert "  Yesterday: Lifting 1h28m, strain 12.3, RPE not logged" in result
+
+
+@patch("src.brief.training.active_injuries", return_value=[])
+@patch("src.brief.training.acute_chronic_ratio")
+@patch("src.brief.db.whoop_workouts_between")
+@patch("src.brief.training.sessions_between")
+def test_training_block_manual_session_and_whoop_workout_both_shown(
+    mock_sessions, mock_workouts, mock_load, mock_injuries
+):
+    """One "Yesterday:" line, combining the WHOOP-measured workout with the
+    hand-logged RPE for the same date, rather than two separate lines."""
+    mock_sessions.return_value = [{"type": "court", "duration_min": 90, "rpe": 6}]
+    mock_workouts.return_value = [
+        {"duration_min": 88, "strain": 12.3, "sport_name": "volleyball"},
+    ]
+    mock_load.return_value = {"acute": 1840.0, "chronic": 1610.0, "ratio": 1.14}
+    result = brief._training_block()
+    lines = result.split("\n")
+    assert lines[0] == "TRAINING"
+    assert lines[1] == "  Yesterday: Volleyball 1h28m, strain 12.3, RPE 6"
+    assert lines[2] == "  7d load 1840, 28d avg 1610"
+
+
+@patch("src.brief.training.active_injuries", return_value=[])
+@patch("src.brief.training.acute_chronic_ratio")
+@patch("src.brief.db.whoop_workouts_between")
+@patch("src.brief.training.sessions_between", return_value=[])
+def test_training_block_multiple_workouts_shows_longest_plus_others_count(
+    mock_sessions, mock_workouts, mock_load, mock_injuries
+):
+    """The longest-by-duration workout leads the line; the rest are summarized
+    as a count rather than dropped or each getting their own line."""
+    mock_workouts.return_value = [
+        {"duration_min": 20, "strain": 4.0, "sport_name": "mobility"},
+        {"duration_min": 60, "strain": 13.5, "sport_name": "volleyball"},
+        {"duration_min": 30, "strain": 6.9, "sport_name": "lifting"},
+    ]
+    mock_load.return_value = {"acute": 0.0, "chronic": 0.0, "ratio": None}
+    result = brief._training_block()
+    assert (
+        "  Yesterday: Volleyball 1h00m, strain 13.5, RPE not logged "
+        "(+2 other activities)" in result
+    )
+
+
+@patch("src.brief.training.active_injuries", return_value=[])
+@patch("src.brief.training.acute_chronic_ratio")
+@patch("src.brief.db.whoop_workouts_between")
+@patch("src.brief.training.sessions_between", return_value=[])
+def test_training_block_longest_workout_selected_even_when_unscored(
+    mock_sessions, mock_workouts, mock_load, mock_injuries
+):
+    """The longest workout by duration_min leads the line even when it has no
+    strain yet: selection is by duration, never by strain."""
+    mock_workouts.return_value = [
+        {"duration_min": 40, "strain": None, "sport_name": "mobility"},
+        {"duration_min": 30, "strain": 1.0, "sport_name": "lifting"},
+    ]
+    mock_load.return_value = {"acute": 0.0, "chronic": 0.0, "ratio": None}
+    result = brief._training_block()
+    assert (
+        "  Yesterday: Mobility 40m, RPE not logged (+1 other activity)" in result
+    )
+
+
+@patch("src.brief.training.active_injuries", return_value=[])
+@patch("src.brief.training.acute_chronic_ratio")
+@patch("src.brief.db.whoop_workouts_between", return_value=[])
+@patch("src.brief.training.sessions_between", return_value=[])
+def test_training_block_empty_when_no_manual_no_whoop_no_injuries_no_load(
+    mock_sessions, mock_workouts, mock_load, mock_injuries
+):
+    mock_load.return_value = {"acute": 0.0, "chronic": 0.0, "ratio": None}
+    assert brief._training_block() == ""
+
+
+@patch("src.brief.training.active_injuries", return_value=[])
+@patch("src.brief.training.acute_chronic_ratio")
+@patch("src.brief.db.whoop_workouts_between")
+@patch("src.brief.training.sessions_between", return_value=[])
+def test_training_block_not_empty_when_only_whoop_workouts_present(
+    mock_sessions, mock_workouts, mock_load, mock_injuries
+):
+    mock_workouts.return_value = [{"duration_min": 45, "strain": 9.1}]
+    mock_load.return_value = {"acute": 0.0, "chronic": 0.0, "ratio": None}
+    assert brief._training_block() != ""
+
+
+# --- _training_block: cycle_date wiring -----------------------------------------
+#
+# "Yesterday" for TRAINING is driven by the completed WHOOP cycle's own assigned
+# date (cycle_date), not calendar arithmetic, except when WHOOP is unavailable and
+# no cycle_date was passed. These confirm the date actually used for both queries.
+
+
+@patch("src.brief.training.active_injuries", return_value=[])
+@patch("src.brief.training.acute_chronic_ratio")
+@patch("src.brief.db.whoop_workouts_between", return_value=[])
+@patch("src.brief.training.sessions_between", return_value=[])
+def test_training_block_queries_use_the_passed_cycle_date(
+    mock_sessions, mock_workouts, mock_load, mock_injuries
+):
+    mock_load.return_value = {"acute": 0.0, "chronic": 0.0, "ratio": None}
+    brief._training_block(cycle_date="2026-07-20")
+    mock_sessions.assert_called_once_with("2026-07-20", "2026-07-20")
+    mock_workouts.assert_called_once_with("2026-07-20", "2026-07-20")
+
+
+@patch("src.brief.training.active_injuries", return_value=[])
+@patch("src.brief.training.acute_chronic_ratio")
+@patch("src.brief.db.whoop_workouts_between", return_value=[])
+@patch("src.brief.training.sessions_between", return_value=[])
+def test_training_block_falls_back_to_calendar_yesterday_when_cycle_date_none(
+    mock_sessions, mock_workouts, mock_load, mock_injuries
+):
+    mock_load.return_value = {"acute": 0.0, "chronic": 0.0, "ratio": None}
+    brief._training_block(cycle_date=None)
+    expected = (_today() - timedelta(days=1)).isoformat()
+    mock_sessions.assert_called_once_with(expected, expected)
+    mock_workouts.assert_called_once_with(expected, expected)
+
+
+# --- _yesterday_line -------------------------------------------------------------
+
+
+def test_yesterday_line_selects_longest_workout_by_duration():
+    workouts = [
+        {"duration_min": 20, "strain": 4.0, "sport_name": "lifting"},
+        {"duration_min": 90, "strain": 12.3, "sport_name": "volleyball"},
+        {"duration_min": 30, "strain": 6.9, "sport_name": "running"},
+    ]
+    result = brief._yesterday_line(workouts, [])
+    assert result.startswith("  Yesterday: Volleyball 1h30m")
+
+
+def test_yesterday_line_sport_name_is_capitalized():
+    workouts = [{"duration_min": 60, "strain": 5.0, "sport_name": "volleyball"}]
+    result = brief._yesterday_line(workouts, [])
+    assert "Volleyball" in result
+
+
+def test_yesterday_line_omits_strain_part_when_longest_has_none():
+    workouts = [{"duration_min": 40, "strain": None, "sport_name": "lifting"}]
+    result = brief._yesterday_line(workouts, [])
+    assert result == "  Yesterday: Lifting 40m, RPE not logged"
+    assert "strain" not in result
+
+
+def test_yesterday_line_shows_logged_rpe_from_sessions():
+    workouts = [{"duration_min": 90, "strain": 12.3, "sport_name": "volleyball"}]
+    sessions = [{"rpe": 5}, {"rpe": 7}]  # max of the day's sessions
+    result = brief._yesterday_line(workouts, sessions)
+    assert result == "  Yesterday: Volleyball 1h30m, strain 12.3, RPE 7"
+
+
+def test_yesterday_line_rpe_not_logged_when_no_sessions_for_the_date():
+    workouts = [{"duration_min": 90, "strain": 12.3, "sport_name": "volleyball"}]
+    result = brief._yesterday_line(workouts, [])
+    assert "RPE not logged" in result
+
+
+def test_yesterday_line_no_others_suffix_for_a_single_workout():
+    workouts = [{"duration_min": 90, "strain": 12.3, "sport_name": "volleyball"}]
+    result = brief._yesterday_line(workouts, [])
+    assert "other activit" not in result
+
+
+def test_yesterday_line_one_other_activity_is_singular():
+    workouts = [
+        {"duration_min": 90, "strain": 12.3, "sport_name": "volleyball"},
+        {"duration_min": 20, "strain": 4.0, "sport_name": "lifting"},
+    ]
+    result = brief._yesterday_line(workouts, [])
+    assert result.endswith("(+1 other activity)")
+
+
+def test_yesterday_line_two_others_is_plural():
+    workouts = [
+        {"duration_min": 90, "strain": 12.3, "sport_name": "volleyball"},
+        {"duration_min": 20, "strain": 4.0, "sport_name": "lifting"},
+        {"duration_min": 30, "strain": 6.9, "sport_name": "running"},
+    ]
+    result = brief._yesterday_line(workouts, [])
+    assert result.endswith("(+2 other activities)")
+
+
+def test_yesterday_line_falls_back_to_manual_session_when_no_workouts():
+    sessions = [{"type": "court", "duration_min": 90, "rpe": 6}]
+    assert brief._yesterday_line([], sessions) == "  Yesterday: court 90min RPE 6"
+
+
+def test_yesterday_line_nothing_logged_when_neither_source_has_anything():
+    assert brief._yesterday_line([], []) == "  Yesterday: nothing logged"
+
+
+# --- _workout_sport --------------------------------------------------------------
+
+
+def test_workout_sport_uses_stored_sport_name_column():
+    assert brief._workout_sport({"sport_name": "volleyball"}) == "Volleyball"
+
+
+def test_workout_sport_falls_back_to_raw_json_when_column_is_none():
+    workout = {
+        "sport_name": None,
+        "raw_json": json.dumps({"sport_name": "weightlifting"}),
+    }
+    assert brief._workout_sport(workout) == "Weightlifting"
+
+
+def test_workout_sport_falls_back_to_sport_id_when_no_name_anywhere():
+    workout = {"sport_name": None, "raw_json": None, "sport_id": 45}
+    assert brief._workout_sport(workout) == "Sport 45"
+
+
+def test_workout_sport_falls_back_to_workout_when_no_id_either():
+    workout = {"sport_name": None, "raw_json": None, "sport_id": None}
+    assert brief._workout_sport(workout) == "Workout"
+
+
+# --- _fmt_workout_dur --------------------------------------------------------------
+
+
+def test_fmt_workout_dur_over_an_hour():
+    assert brief._fmt_workout_dur(125) == "2h05m"
+
+
+def test_fmt_workout_dur_under_an_hour_has_no_hour_part():
+    assert brief._fmt_workout_dur(54) == "54m"
+
+
+def test_fmt_workout_dur_exact_hour_pads_minutes():
+    assert brief._fmt_workout_dur(60) == "1h00m"
+
+
+def test_fmt_workout_dur_none_is_question_mark():
+    assert brief._fmt_workout_dur(None) == "?"
+
+
+# --- _date_rpe ---------------------------------------------------------------------
+
+
+def test_date_rpe_empty_list_is_none():
+    assert brief._date_rpe([]) is None
+
+
+def test_date_rpe_is_the_max_among_non_null_sessions():
+    sessions = [{"rpe": 5}, {"rpe": 8}, {"rpe": None}]
+    assert brief._date_rpe(sessions) == 8
+
+
+def test_date_rpe_preserves_a_half_point_float():
+    assert brief._date_rpe([{"rpe": 7.5}]) == 7.5
 
 
 # --- _today_block --------------------------------------------------------------
