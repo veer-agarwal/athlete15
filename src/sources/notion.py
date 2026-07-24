@@ -36,12 +36,16 @@ NOTION_VERSION = "2026-03-11"
 # week" without dragging in end of semester projects all term.
 HORIZON_DAYS = 14
 
-REQUEST_TIMEOUT_SECONDS = 15
+# (connect, read). The read leg is long for the same reason as WHOOP's: the first
+# call right after S3 wake is a cold TLS connection and was timing out at a flat
+# 15s. A short connect leg still fails fast on a genuinely dead adapter.
+REQUEST_TIMEOUT_SECONDS = (10, 45)
 RETRY_ATTEMPTS = 3
-# Backoff before attempt 2 and attempt 3. Doubling, not fixed like brief.py's
-# wake retry: here the failure being handled is Notion telling us to slow down
-# or having a bad minute, not a network adapter that is still associating.
-BACKOFF_SECONDS = (2, 5)
+# Backoff before attempt 2 and attempt 3. Sized for the post-wake case the 7 AM
+# job actually hits: the network is still settling for tens of seconds, so a 2s
+# retry just burns an attempt. 15s then 30s gives the adapter real time to come
+# up. A 429 overrides this with its own Retry-After.
+BACKOFF_SECONDS = (15, 30)
 # Ceiling on how long a Retry-After header is honored. Notion's are single digit
 # seconds in practice; a briefing job must not sleep for minutes because a proxy
 # somewhere sent a strange header.
