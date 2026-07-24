@@ -73,6 +73,12 @@ SCOPES = [
 # morning briefing's.
 FETCH_LOOKBACK_DAYS = 3
 
+# How far a sleep's start may sit from a cycle's own start and still count as the
+# sleep that OPENED that cycle. A WHOOP cycle begins at sleep onset, so for the real
+# opening sleep this gap is seconds; a nap, or a sleep reached through _sleep_for's
+# fallback, is hours away. See _metric_date.
+OPENING_SLEEP_SLACK = timedelta(hours=2)
+
 # (connect, read) rather than one scalar. The read leg is generous because the
 # real failure this fixes was a token refresh whose response arrived just after a
 # 15s cap on a cold connection right after S3 wake: WHOOP had already rotated the
@@ -289,6 +295,56 @@ def _local_dt_str(timestamp: str | None, offset: str | None) -> str:
     return _to_local(timestamp, offset).strftime("%Y-%m-%d %H:%M")
 
 
+def _instant(timestamp: str | None) -> datetime | None:
+    """A WHOOP UTC timestamp as an aware datetime, for interval comparison."""
+    if not timestamp:
+        return None
+    return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+
+
+def _opens_cycle(cycle: dict, sleep: dict) -> bool:
+    """Whether this sleep is the one that OPENED this cycle.
+
+    Unverifiable (either start missing) counts as True. The check exists to reject
+    a sleep that provably belongs elsewhere, not to throw away a wake date because
+    a record came back thin.
+    """
+    cycle_start = _instant(cycle.get("start"))
+    sleep_start = _instant(sleep.get("start"))
+    if cycle_start is None or sleep_start is None:
+        return True
+    return abs(sleep_start - cycle_start) <= OPENING_SLEEP_SLACK
+
+
+def _cycle_sleep(cycle: dict, sleep: dict | None) -> dict | None:
+    """The sleep record if it opened this cycle, otherwise None.
+
+    Applied before ANY field is read off a sleep, not only before it is used to
+    date the cycle. A sleep that did not open this cycle is the wrong night's
+    numbers as much as the wrong date, and dropping only its end timestamp would
+    leave "Sleep 1h00m (14%)" from a nap sitting under a correct date, which is
+    the harder of the two to notice.
+
+    Logged at warning when it rejects one. The 2 hour slack is a judgement call
+    with no data behind it, and a silent rejection reads in brief.log exactly like
+    a cycle that simply had no sleep.
+    """
+    if sleep is None:
+        return None
+    if _opens_cycle(cycle, sleep):
+        return sleep
+
+    logging.warning(
+        "whoop: cycle %s starts %s but sleep %s starts %s, too far apart to be the "
+        "sleep that opened it. dropping the sleep rather than dating the cycle by it",
+        cycle.get("id"),
+        _local_dt_str(cycle.get("start"), cycle.get("timezone_offset")),
+        sleep.get("id"),
+        _local_dt_str(sleep.get("start"), sleep.get("timezone_offset")),
+    )
+    return None
+
+
 def _metric_date(cycle: dict, sleep: dict | None) -> str:
     """The date this row belongs to: the local date you woke up.
 
@@ -296,13 +352,28 @@ def _metric_date(cycle: dict, sleep: dict | None) -> str:
     endpoints are bedtimes rather than the waking day. The end of the sleep at the
     head of the cycle is the actual wake instant, so prefer that.
 
-    The fallback, used for cycles seen without a scored sleep, is the cycle START.
+    Sleep END, not sleep start, and that survived a second look. Sleep start is the
+    same instant as the cycle start (the cycle begins when you fall asleep), so
+    labeling by it would collapse this into the fallback below and hand every
+    pre-midnight bedtime the date of the day BEFORE the one it covers: an 11 PM
+    Thursday bedtime would file Friday's recovery, sleep and strain under Thursday,
+    and TRAINING would then query Thursday's workouts for Friday's cycle. Cycle end
+    is the dangerous one, because it is shared with the next cycle's start; sleep
+    end is shared with nothing.
+
+    What sleep end DOES need is proof that the sleep belongs to this cycle at all.
+    _sleep_for falls back to the cycle's own sleep endpoint, which can hand back a
+    nap, and a nap ending at 02:35 would shift the whole cycle onto the next day
+    exactly the way the cycle-end fallback did. So the wake instant is only trusted
+    when the sleep opened this cycle.
+
+    The fallback, used for cycles seen without a usable sleep, is the cycle START.
     Never the end: a cycle's end IS the next cycle's start, so labeling by it shifts
     every day forward and hands each cycle the date belonging to its successor. On
     real data that mislabeled cycle 1644738825 (2026-07-16 01:09 to 2026-07-17
     02:35) as 07-17, which is the day the following cycle actually starts.
     """
-    if sleep and sleep.get("end"):
+    if sleep and sleep.get("end") and _opens_cycle(cycle, sleep):
         return _local_date(sleep["end"], sleep.get("timezone_offset"))
     return _local_date(cycle["start"], cycle.get("timezone_offset"))
 
@@ -322,7 +393,13 @@ def _row(cycle: dict, recovery: dict | None, sleep: dict | None) -> dict:
 
     The keys are exactly what db.upsert_daily_metrics accepts, so backfill can hand
     the dict straight over without a translation step in between.
+
+    A sleep that did not open this cycle is dropped here, so it can reach neither
+    the date nor the sleep columns. This is the last line of defence: fetch() and
+    fetch_current() skip such a cycle before getting here, but backfill joins its
+    collections locally and never calls them.
     """
+    sleep = _cycle_sleep(cycle, sleep)
     strain_score = cycle.get("score") or {}
     recovery_score = (recovery or {}).get("score") or {}
     sleep_score = (sleep or {}).get("score") or {}
@@ -351,6 +428,21 @@ def _is_finished(cycle: dict) -> bool:
     closed cycle is still not a usable one.
     """
     return bool(cycle.get("end")) and cycle.get("score_state") == "SCORED"
+
+
+def _is_open(cycle: dict) -> bool:
+    """Whether this is the cycle you are currently living in.
+
+    A cycle closes at the next sleep onset, so at most one is open at a time and it
+    is the one covering today: last night's sleep at its head, this morning's
+    recovery, and today's strain still accumulating. `end` is null until tonight.
+
+    Deliberately says nothing about score_state. The cycle score of an open cycle
+    is PENDING_SCORE all day because day strain is not final, while its recovery and
+    sleep are scored the moment you wake up. Those are the fields fetch_current
+    wants, and gating on the cycle's own score_state would reject every one of them.
+    """
+    return not cycle.get("end")
 
 
 def _scored(record: dict | None) -> dict | None:
@@ -390,16 +482,63 @@ def _auth_failed(exc: OAuthError) -> WhoopAuthError:
     return WhoopAuthError(f"WHOOP rejected the stored token: {exc}")
 
 
-def fetch() -> list[dict]:
-    """Return the most recent complete day of recovery, sleep and strain.
+def _recovery_and_sleep(
+    client: WhoopClient, cycle: dict
+) -> tuple[dict, dict] | None:
+    """The scored recovery and the scored sleep that OPENED this cycle, or None if
+    either is missing.
 
-    Returns an empty list when the sleep cycle has not closed yet. That is a normal
-    condition, not an error.
+    Shared by fetch() and fetch_current() so both apply the same test for "WHOOP has
+    finished with this cycle's sleep". The cycle is skipped outright when the sleep
+    on hand did not open it, rather than kept with its sleep columns blanked: with
+    no sleep, _metric_date falls back to the cycle START, which for any pre-midnight
+    bedtime is the day before the cycle covers. That would file the open cycle under
+    the same date as the completed one and let the two rows merge in daily_metrics,
+    losing this morning's recovery to yesterday's numbers.
+    """
+    recovery = _scored(_get_or_none(client.get_recovery_for_cycle, cycle["id"]))
+    if recovery is None:
+        logging.info("whoop: cycle %s has no scored recovery", cycle["id"])
+        return None
+
+    sleep = _cycle_sleep(cycle, _sleep_for(client, cycle, recovery))
+    if sleep is None:
+        logging.info("whoop: cycle %s has no scored sleep of its own", cycle["id"])
+        return None
+
+    return recovery, sleep
+
+
+def _log_bucketing(cycle: dict, row: dict, role: str) -> None:
+    """Record how a cycle's local date was derived, and which briefing role it
+    plays. Lets a wrong bucket be caught by reading brief.log against the WHOOP app
+    rather than guessed at."""
+    logging.info(
+        "whoop %s cycle %s: local start %s, end %s -> assigned date %s",
+        role,
+        cycle.get("id"),
+        _local_dt_str(cycle.get("start"), cycle.get("timezone_offset")),
+        _local_dt_str(cycle.get("end"), cycle.get("timezone_offset")),
+        row["date"],
+    )
+
+
+def fetch() -> list[dict]:
+    """Return the most recent COMPLETED day of recovery, sleep and strain.
+
+    This is yesterday. The briefing takes day strain and the TRAINING block's date
+    from here, and takes recovery and last night's sleep from fetch_current()
+    instead. Those are two different cycles and reading both off this one is what
+    made the header show the night before last. The recovery and sleep columns are
+    still returned and still stored, because this row is also what backfills
+    yesterday's history; they simply are not what the header prints.
+
+    Returns an empty list when no cycle in the window has closed and scored. That
+    is a normal condition, not an error.
 
     "Complete" means the cycle has closed and all three of the cycle, its recovery
     and its sleep are SCORED. Day strain only finishes accumulating when the cycle
-    ends, so at 7:00 AM the newest complete day is yesterday, not today. If you woke
-    up but the strap has not synced, nothing is scored yet and you get [] instead.
+    ends, so at 7:00 AM the newest complete day is yesterday, not today.
 
     Raises:
         RuntimeError: if no token has been stored yet.
@@ -418,28 +557,12 @@ def fetch() -> list[dict]:
             if not _is_finished(cycle):
                 continue
 
-            recovery = _scored(_get_or_none(client.get_recovery_for_cycle, cycle["id"]))
-            if recovery is None:
-                logging.info("whoop: cycle %s has no scored recovery", cycle["id"])
+            scored = _recovery_and_sleep(client, cycle)
+            if scored is None:
                 continue
 
-            sleep = _sleep_for(client, cycle, recovery)
-            if sleep is None:
-                logging.info("whoop: cycle %s has no scored sleep", cycle["id"])
-                continue
-
-            row = _row(cycle, recovery, sleep)
-            # The date-bucketing audit trail. "Yesterday" in the briefing is this
-            # completed cycle, and this line records exactly how its local date was
-            # derived so a wrong bucket can be caught by reading brief.log against
-            # the WHOOP app rather than guessed at.
-            logging.info(
-                "whoop cycle %s: local start %s, end %s -> assigned date %s",
-                cycle.get("id"),
-                _local_dt_str(cycle.get("start"), cycle.get("timezone_offset")),
-                _local_dt_str(cycle.get("end"), cycle.get("timezone_offset")),
-                row["date"],
-            )
+            row = _row(cycle, *scored)
+            _log_bucketing(cycle, row, "completed")
             return [row]
     except OAuthError as exc:
         # The auto-refresh inside a data call failed at the grant level. This is
@@ -454,6 +577,65 @@ def fetch() -> list[dict]:
         FETCH_LOOKBACK_DAYS,
     )
     return []
+
+
+def fetch_current() -> list[dict]:
+    """Return the cycle in progress: last night's sleep and this morning's recovery.
+
+    The header of the briefing comes from here. Recovery is scored the moment the
+    sleep that OPENS a cycle closes, and that sleep is last night's, so the open
+    cycle is where this morning's readiness lives. The most recently completed
+    cycle, which fetch() returns, closed at last night's bedtime and carries the
+    night BEFORE last: reading the header off it printed sleep one night stale
+    every morning.
+
+    strain is deliberately None even though the open cycle has a running value.
+    Day strain is still climbing until tonight's bedtime, and upsert_daily_metrics
+    COALESCEs, so storing a partial number now would sit in daily_metrics until
+    something non-null replaced it and would quietly poison a load trend if
+    tomorrow's run never happened. The full cycle payload with its partial strain
+    is still kept in `raw`.
+
+    Returns an empty list when the strap has not synced or you have not woken up
+    yet, so nothing is scored. Normal before wake, not an error, and it is the
+    condition --wait-for-wake polls on.
+
+    Raises:
+        RuntimeError: if no token has been stored yet.
+        WhoopAuthError: if WHOOP rejected the token. Fatal, do not retry.
+        requests.HTTPError: for any API failure other than a 404 on a
+            sub-resource that does not exist.
+    """
+    start = datetime.now(timezone.utc).date() - timedelta(days=FETCH_LOOKBACK_DAYS)
+
+    client = _authorized_client()
+    try:
+        cycles = client.get_cycle_collection(start_date=start.isoformat())
+        # At most one cycle can be open, since a cycle closes the instant the next
+        # one starts, so this is unambiguous. Scanned rather than read off cycles[0]
+        # so it does not depend on the collection staying newest-first: if that
+        # order ever changed, indexing would return [] forever, which is
+        # indistinguishable from "not awake yet" and would silently ship a
+        # recovery-less briefing every morning until someone read the log.
+        current = next((cycle for cycle in cycles if _is_open(cycle)), None)
+        if current is None:
+            logging.info(
+                "whoop: no cycle in progress in the last %d days", FETCH_LOOKBACK_DAYS
+            )
+            return []
+
+        scored = _recovery_and_sleep(client, current)
+        if scored is None:
+            return []
+
+        row = _row(current, *scored)
+        row["strain"] = None
+        _log_bucketing(current, row, "current")
+        return [row]
+    except OAuthError as exc:
+        raise _auth_failed(exc) from exc
+    finally:
+        client.close()
 
 
 def _sleep_for(client: WhoopClient, cycle: dict, recovery: dict) -> dict | None:
@@ -563,20 +745,34 @@ def audit(days: int = 7) -> list[dict]:
     briefing too. Newest cycle first. Unfinished cycles are included on purpose so
     the current day shows too; day strain on those is still climbing.
 
-    Each row: date, cycle_id, start_local, end_local, strain, recovery_score,
-    sleep_hours, sleep_performance, workouts[{sport, duration_min, strain}].
+    Also reports, per cycle, which briefing fields the code pulls from it:
+    briefing_role is 'current' for the cycle the header's recovery and sleep come
+    from, 'completed' for the one day strain and TRAINING come from, and None for
+    every other cycle. That mapping is the part most worth checking by eye, since a
+    cycle carrying the right numbers under the right date can still be the wrong
+    cycle for the field the briefing prints it in.
+
+    Each row: date, cycle_id, briefing_role, start_local, end_local, strain,
+    recovery_score, sleep_hours, sleep_performance,
+    workouts[{sport, duration_min, strain}].
 
     Raises:
         RuntimeError: if no token has been stored yet.
         WhoopAuthError: if WHOOP rejected the token.
     """
     start = (date.today() - timedelta(days=days)).isoformat()
+    # Sleep window widened by a day for the same reason backfill widens it: the
+    # sleep that opened the oldest cycle in range began the night before that cycle
+    # starts. Without this the oldest row loses its sleep, falls back to dating
+    # itself by the cycle start, and disagrees with the briefing on the one row
+    # nobody thinks to check.
+    sleep_start = (date.today() - timedelta(days=days + 1)).isoformat()
 
     client = _authorized_client()
     try:
         cycles = client.get_cycle_collection(start_date=start)
         recoveries = client.get_recovery_collection(start_date=start)
-        sleeps = client.get_sleep_collection(start_date=start)
+        sleeps = client.get_sleep_collection(start_date=sleep_start)
     except OAuthError as exc:
         raise _auth_failed(exc) from exc
     finally:
@@ -588,21 +784,64 @@ def audit(days: int = 7) -> list[dict]:
     recovery_by_cycle = {r["cycle_id"]: r for r in recoveries if _scored(r)}
     sleep_by_id = {s["id"]: s for s in sleeps if _scored(s)}
 
-    def _instant(timestamp: str | None) -> datetime | None:
-        """A WHOOP UTC timestamp as an aware datetime, for interval comparison."""
-        if not timestamp:
-            return None
-        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-
     # Which cycles claimed each workout, so an overlap can be reported rather than
     # silently double counted.
     claimed_by: dict[str, list] = {}
 
+    def _opening_sleep(cycle: dict, recovery: dict | None) -> dict | None:
+        """The scored sleep that opened this cycle, from the collections in hand.
+
+        Mirrors _sleep_for, which fetch() uses: the recovery's own sleep_id first,
+        then the sleep whose start opens the cycle, which is what that function's
+        get_sleep_for_cycle fallback returns. Without the second step a cycle whose
+        recovery carries no sleep_id would be skipped here and accepted by fetch(),
+        and the table would name a different cycle as the strain source than the
+        briefing actually read, which is the one thing briefing_role exists to rule
+        out. A sleep with no start is not scanned for: _opens_cycle deliberately
+        fails open on a missing timestamp, which is right when checking a specific
+        record and wrong when picking one out of a list.
+        """
+        candidate = sleep_by_id.get(recovery.get("sleep_id")) if recovery else None
+        sleep = _cycle_sleep(cycle, candidate)
+        if sleep is not None:
+            return sleep
+        return next(
+            (s for s in sleep_by_id.values()
+             if s.get("start") and _opens_cycle(cycle, s)),
+            None,
+        )
+
+    # Which cycle the briefing reads each field from, applying the same selection
+    # rules, INCLUDING the scoring requirements, that fetch_current() and fetch()
+    # apply. 'current' feeds the header (recovery, sleep, HRV, RHR), 'completed'
+    # feeds day strain and the TRAINING block's date and workouts. A cycle the
+    # briefing would currently get nothing from reports as unused rather than as a
+    # source, so running this before the strap syncs tells the truth.
+    #
+    # The audit window is wider than FETCH_LOOKBACK_DAYS, so after several days of
+    # not wearing the strap this can name a completed cycle fetch() cannot reach.
+    # The start and end columns on the row show how old it is.
+    open_cycle = next((cycle for cycle in cycles if _is_open(cycle)), None)
+    completed_id = None
+
     rows = []
     for cycle in cycles:
         recovery = recovery_by_cycle.get(cycle["id"])
-        sleep = sleep_by_id.get(recovery.get("sleep_id")) if recovery else None
+        sleep = _opening_sleep(cycle, recovery)
         assigned = _metric_date(cycle, sleep)
+
+        # First closed-and-scored cycle with both a recovery and a sleep, which is
+        # exactly what fetch() walks the list for. Set here rather than in a second
+        # pass because this loop already runs newest first.
+        if completed_id is None and _is_finished(cycle) and recovery and sleep:
+            completed_id = cycle["id"]
+
+        if open_cycle is not None and cycle["id"] == open_cycle["id"]:
+            role = "current" if (recovery and sleep) else None
+        elif cycle["id"] == completed_id:
+            role = "completed"
+        else:
+            role = None
 
         recovery_score = (recovery or {}).get("score") or {}
         sleep_score = (sleep or {}).get("score") or {}
@@ -630,6 +869,7 @@ def audit(days: int = 7) -> list[dict]:
         rows.append({
             "date": assigned,
             "cycle_id": cycle.get("id"),
+            "briefing_role": role,
             "start_local": _local_dt_str(cycle.get("start"), cycle.get("timezone_offset")),
             "end_local": _local_dt_str(cycle.get("end"), cycle.get("timezone_offset")),
             "strain": cycle_score.get("strain"),

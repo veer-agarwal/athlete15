@@ -92,48 +92,92 @@ def test_session_desc_only_type():
     assert brief._session_desc(session) == "court"
 
 
+# --- _fetch_current / _fetch_metrics persistence ---------------------------------
+
+
+@patch("src.brief.db.upsert_daily_metrics")
+@patch("src.brief.whoop.fetch_current")
+def test_fetch_current_stores_the_row_with_a_null_strain(mock_fetch, mock_upsert):
+    """The whole justification for blanking strain on the open cycle.
+
+    upsert_daily_metrics COALESCEs with non-null winning, so a strain written here
+    would sit in daily_metrics until something replaced it. Passing None leaves
+    whatever is already stored alone, and tomorrow's completed-cycle run writes the
+    final number for this date.
+    """
+    row = {"date": "2026-07-24", "recovery_score": 79, "sleep_hours": 7.5,
+           "strain": None}
+    mock_fetch.return_value = [row]
+
+    assert brief._fetch_current() == row
+    mock_upsert.assert_called_once_with(row)
+    assert mock_upsert.call_args.args[0]["strain"] is None
+
+
+@patch("src.brief.db.upsert_daily_metrics")
+@patch("src.brief.whoop.fetch_current", return_value=[])
+def test_fetch_current_stores_nothing_when_nothing_is_scored(mock_fetch, mock_upsert):
+    assert brief._fetch_current() is None
+    mock_upsert.assert_not_called()
+
+
+@patch("src.brief.db.upsert_daily_metrics", side_effect=RuntimeError("database locked"))
+@patch("src.brief.whoop.fetch_current")
+def test_fetch_current_survives_a_storage_failure(mock_fetch, mock_upsert):
+    """The numbers are already in hand; a locked database must not cost the
+    message its header."""
+    row = {"date": "2026-07-24", "recovery_score": 79}
+    mock_fetch.return_value = [row]
+
+    assert brief._fetch_current() == row
+
+
 # --- _metrics_line -------------------------------------------------------------
 
 
 def test_metrics_line_full():
-    metrics = {
+    current = {
         "recovery_score": 54,
         "sleep_hours": 6.2,
         "sleep_performance": 71,
         "hrv_ms": 62,
         "resting_hr": 51,
     }
-    assert brief._metrics_line(metrics) == (
+    assert brief._metrics_line(current, None) == (
         "Recovery 54  |  Sleep 6h12m (71%)  |  HRV 62  |  RHR 51"
     )
 
 
 def test_metrics_line_missing_fields_are_omitted():
-    metrics = {"recovery_score": 54, "sleep_hours": None, "hrv_ms": None, "resting_hr": None}
-    assert brief._metrics_line(metrics) == "Recovery 54"
+    current = {"recovery_score": 54, "sleep_hours": None, "hrv_ms": None, "resting_hr": None}
+    assert brief._metrics_line(current, None) == "Recovery 54"
 
 
 def test_metrics_line_sleep_without_performance_has_no_parens():
-    metrics = {"recovery_score": None, "sleep_hours": 6.2, "sleep_performance": None,
+    current = {"recovery_score": None, "sleep_hours": 6.2, "sleep_performance": None,
                "hrv_ms": None, "resting_hr": None}
-    assert brief._metrics_line(metrics) == "Sleep 6h12m"
+    assert brief._metrics_line(current, None) == "Sleep 6h12m"
 
 
 def test_metrics_line_all_missing_is_empty():
-    metrics = {"recovery_score": None, "sleep_hours": None, "hrv_ms": None, "resting_hr": None}
-    assert brief._metrics_line(metrics) == ""
+    current = {"recovery_score": None, "sleep_hours": None, "hrv_ms": None, "resting_hr": None}
+    assert brief._metrics_line(current, None) == ""
 
 
 def test_metrics_line_empty_dict_is_empty():
-    assert brief._metrics_line({}) == ""
+    assert brief._metrics_line({}, {}) == ""
+
+
+def test_metrics_line_both_none_is_empty():
+    """Both cycles unavailable. build() can still call this, since it renders the
+    line whenever EITHER cycle came back."""
+    assert brief._metrics_line(None, None) == ""
 
 
 def test_metrics_line_with_strain_adds_second_exact_line():
-    metrics = {
-        "recovery_score": 54, "sleep_hours": None, "hrv_ms": None, "resting_hr": None,
-        "strain": 14.6,
-    }
-    result = brief._metrics_line(metrics)
+    current = {"recovery_score": 54, "sleep_hours": None, "hrv_ms": None, "resting_hr": None}
+    completed = {"strain": 14.6}
+    result = brief._metrics_line(current, completed)
     lines = result.split("\n")
     assert len(lines) == 2
     assert lines[0] == "Recovery 54"
@@ -141,19 +185,40 @@ def test_metrics_line_with_strain_adds_second_exact_line():
 
 
 def test_metrics_line_strain_none_omits_second_line():
-    metrics = {
-        "recovery_score": 54, "sleep_hours": None, "hrv_ms": None, "resting_hr": None,
-        "strain": None,
-    }
-    assert brief._metrics_line(metrics) == "Recovery 54"
+    current = {"recovery_score": 54, "sleep_hours": None, "hrv_ms": None, "resting_hr": None}
+    assert brief._metrics_line(current, {"strain": None}) == "Recovery 54"
 
 
 def test_metrics_line_only_strain_present_no_recovery_line():
-    metrics = {
-        "recovery_score": None, "sleep_hours": None, "hrv_ms": None, "resting_hr": None,
-        "strain": 9.2,
-    }
-    assert brief._metrics_line(metrics) == "Yesterday's Strain 9.2"
+    assert brief._metrics_line(None, {"strain": 9.2}) == "Yesterday's Strain 9.2"
+
+
+def test_metrics_line_takes_recovery_and_sleep_only_from_the_current_cycle():
+    """The whole point of the split. The completed cycle carries a full set of
+    recovery and sleep numbers from the night before last; none of them may reach
+    the header, and its strain must still reach the strain line.
+    """
+    current = {"recovery_score": 79, "sleep_hours": 7.5, "sleep_performance": 88,
+               "hrv_ms": 70, "resting_hr": 48}
+    completed = {"recovery_score": 41, "sleep_hours": 5.0, "sleep_performance": 60,
+                 "hrv_ms": 55, "resting_hr": 57, "strain": 14.2}
+
+    result = brief._metrics_line(current, completed)
+
+    assert result == (
+        "Recovery 79  |  Sleep 7h30m (88%)  |  HRV 70  |  RHR 48\n"
+        "Yesterday's Strain 14.2"
+    )
+
+
+def test_metrics_line_omits_header_rather_than_falling_back_to_completed():
+    """No current cycle yet (strap not synced) prints no recovery or sleep at all.
+
+    Falling back to the completed cycle here is exactly the stale-by-one-night bug:
+    it would print the night before last under a header stamped with today.
+    """
+    completed = {"recovery_score": 41, "sleep_hours": 5.0, "strain": 14.2}
+    assert brief._metrics_line(None, completed) == "Yesterday's Strain 14.2"
 
 
 # --- _sleep_note -----------------------------------------------------------------
@@ -730,6 +795,8 @@ def test_today_block_event_without_location_has_no_dash_suffix(mock_fetch):
 # --- build() ---------------------------------------------------------------------
 
 
+@patch("src.brief._store_yesterday_workouts")
+@patch("src.brief._fetch_current", return_value=None)
 @patch("src.brief._fetch_metrics", return_value=None)
 @patch("src.brief._news_block", return_value="NEWS\n  - headline one")
 @patch("src.brief._weather_block", return_value="72F, high 84, partly cloudy, 20% precip")
@@ -737,7 +804,8 @@ def test_today_block_event_without_location_has_no_dash_suffix(mock_fetch):
 @patch("src.brief._due_block", return_value="")
 @patch("src.brief._today_block", return_value="")
 def test_build_joins_nonempty_blocks_with_blank_lines(
-    mock_today, mock_due, mock_training, mock_weather, mock_news, mock_metrics
+    mock_today, mock_due, mock_training, mock_weather, mock_news,
+    mock_metrics, mock_current, mock_store,
 ):
     result = brief.build()
     assert result == (
@@ -745,6 +813,8 @@ def test_build_joins_nonempty_blocks_with_blank_lines(
     )
 
 
+@patch("src.brief._store_yesterday_workouts")
+@patch("src.brief._fetch_current", return_value=None)
 @patch("src.brief._fetch_metrics", return_value=None)
 @patch("src.brief._news_block", return_value="")
 @patch("src.brief._weather_block", return_value="")
@@ -752,6 +822,51 @@ def test_build_joins_nonempty_blocks_with_blank_lines(
 @patch("src.brief._due_block", return_value="")
 @patch("src.brief._today_block", return_value="")
 def test_build_reports_no_data_when_everything_is_empty(
-    mock_today, mock_due, mock_training, mock_weather, mock_news, mock_metrics
+    mock_today, mock_due, mock_training, mock_weather, mock_news,
+    mock_metrics, mock_current, mock_store,
 ):
     assert brief.build() == "no data available this morning"
+
+
+@patch("src.brief._store_yesterday_workouts")
+@patch("src.brief._sleep_note", return_value="")
+@patch("src.brief._news_block", return_value="")
+@patch("src.brief._weather_block", return_value="")
+@patch("src.brief._training_block", return_value="")
+@patch("src.brief._due_block", return_value="")
+@patch("src.brief._today_block", return_value="")
+@patch("src.brief._fetch_current", return_value={"date": "2026-07-24", "recovery_score": 79,
+                                                 "sleep_hours": 7.5, "sleep_performance": 79})
+@patch("src.brief._fetch_metrics", return_value={"date": "2026-07-23", "recovery_score": 41,
+                                                 "sleep_hours": 5.0, "strain": 14.2})
+def test_build_header_reads_current_cycle_and_strain_reads_completed(
+    mock_metrics, mock_current, mock_today, mock_due, mock_training,
+    mock_weather, mock_news, mock_note, mock_store,
+):
+    """End to end through build(): the two cycles land in the two lines they own."""
+    result = brief.build()
+    assert result == (
+        "Recovery 79  |  Sleep 7h30m (79%)\nYesterday's Strain 14.2"
+    )
+
+
+@patch("src.brief._store_yesterday_workouts")
+@patch("src.brief._sleep_note", return_value="")
+@patch("src.brief._news_block", return_value="")
+@patch("src.brief._weather_block", return_value="")
+@patch("src.brief._due_block", return_value="")
+@patch("src.brief._today_block", return_value="")
+@patch("src.brief._training_block", return_value="")
+@patch("src.brief._fetch_current", return_value={"date": "2026-07-24"})
+@patch("src.brief._fetch_metrics", return_value={"date": "2026-07-23"})
+def test_build_passes_the_completed_cycle_date_to_training(
+    mock_metrics, mock_current, mock_training, mock_today, mock_due,
+    mock_weather, mock_news, mock_note, mock_store,
+):
+    """TRAINING buckets on the COMPLETED cycle's date, never the current one.
+
+    Yesterday's workouts belong to yesterday's cycle; passing the current cycle's
+    date would ask for today's, which at 7 AM is empty.
+    """
+    brief.build()
+    mock_training.assert_called_once_with("2026-07-23")

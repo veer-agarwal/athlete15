@@ -153,14 +153,20 @@ def _is_main_sleep(metrics: dict) -> bool:
 
 
 def wait_for_wake() -> None:
-    """Poll WHOOP after an S3 wake until the sleep cycle closes, then deliver.
+    """Poll WHOOP after an S3 wake until last night's sleep is scored, then deliver.
+
+    Polls whoop.fetch_current(), the cycle in progress, NOT whoop.fetch(). The
+    most recently completed cycle closed when you went to bed and is scored while
+    you are still asleep, so waiting on it fired the briefing in the middle of the
+    night with the previous night's numbers. The open cycle gets a scored recovery
+    and sleep only once you wake and the strap syncs, which is the event this is
+    actually waiting for.
 
     Idempotent: if a briefing is already recorded for today, exits without
-    sending a second one. Distinguishes "no completed cycle yet" (retry) from
-    "WHOOP request failed" (network) from "WHOOP auth failed" (fatal, stop
-    polling) so a slow strap sync is never misread as an outage. At the 11:00
-    local cutoff it sends whatever the other sources have, with a note that no
-    completed cycle was found.
+    sending a second one. Distinguishes "not scored yet" (retry) from "WHOOP
+    request failed" (network) from "WHOOP auth failed" (fatal, stop polling) so a
+    slow strap sync is never misread as an outage. At the 11:00 local cutoff it
+    sends whatever the other sources have, with a note saying so.
     """
     tz = ZoneInfo(config.TIMEZONE)
     today = datetime.now(tz).strftime("%Y-%m-%d")
@@ -186,10 +192,10 @@ def wait_for_wake() -> None:
             return
 
         try:
-            items = whoop.fetch()
+            items = whoop.fetch_current()
         except whoop.WhoopAuthError:
             # The stored token is dead; WHOOP cannot succeed this run no matter how
-            # long we wait. whoop.fetch already logged the --auth remediation line.
+            # long we wait. fetch_current already logged the --auth remediation line.
             logging.error("WHOOP auth failed during wake wait, delivering without recovery")
             _deliver(note="WHOOP auth failed, recovery unavailable. Run: python -m src.main --auth")
             return
@@ -200,18 +206,18 @@ def wait_for_wake() -> None:
             logging.warning("WHOOP request failed (will retry): %s", exc)
         else:
             if items and _is_main_sleep(items[0]):
-                logging.info("completed main-sleep cycle found, delivering briefing")
+                logging.info("last night's sleep is scored, delivering briefing")
                 _deliver()
                 return
-            logging.info("whoop: no completed main-sleep cycle yet")
+            logging.info("whoop: last night's main sleep is not scored yet")
 
         if datetime.now(tz) >= cutoff:
             logging.info(
-                "reached %02d:00 cutoff with no completed cycle, sending what is available",
+                "reached %02d:00 cutoff with no scored sleep, sending what is available",
                 CUTOFF_HOUR,
             )
             _deliver(
-                note=f"No completed sleep cycle found by {CUTOFF_HOUR}:00, sending without recovery."
+                note=f"No scored sleep from last night by {CUTOFF_HOUR}:00, sending without recovery."
             )
             return
 
@@ -222,12 +228,27 @@ def wait_for_wake() -> None:
         time.sleep(nap)
 
 
+# What the briefing takes from each cycle, keyed by whoop.audit()'s briefing_role.
+# Printed per cycle so the current/completed split is verifiable from the table
+# alone, without sending a message and reading it on the phone.
+_BRIEFING_ROLE_LINES = {
+    "current": "briefing: recovery, sleep, HRV, RHR -> header line, sleep note",
+    "completed": "briefing: strain -> Yesterday's Strain, workouts + date -> TRAINING",
+    None: "briefing: not used",
+}
+
+
 def whoop_audit() -> int:
     """Print a 7-day WHOOP cycle/workout audit for diffing against the app.
 
     Read-only. Shows each cycle's local start and end, day strain, recovery, and
     sleep next to the local date the code assigned it, plus the workouts bucketed
     onto that date, so date bucketing can be verified by eye against the app.
+
+    Each cycle also gets a line naming the briefing fields sourced from it. Sleep
+    and recovery come from the cycle in progress while strain and TRAINING come
+    from the last completed one, and a table that only showed correct numbers
+    under correct dates could not have caught them being read off the wrong cycle.
     """
     try:
         rows = whoop.audit(days=7)
@@ -264,6 +285,12 @@ def whoop_audit() -> int:
                 )
         else:
             print("      (no workouts)")
+        # Both lookups defensive: a row without the key, or with a role this table
+        # does not know, prints "not used" instead of taking the table down.
+        role_line = _BRIEFING_ROLE_LINES.get(
+            row.get("briefing_role"), _BRIEFING_ROLE_LINES[None]
+        )
+        print(f"    {role_line}")
         print()
     return 0
 

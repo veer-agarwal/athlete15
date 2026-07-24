@@ -124,13 +124,37 @@ def test_wait_for_wake_idempotent_when_brief_already_recorded(monkeypatch):
     mock_deliver = MagicMock()
     monkeypatch.setattr(main, "_deliver", mock_deliver)
     mock_fetch = MagicMock()
-    monkeypatch.setattr(main.whoop, "fetch", mock_fetch)
+    monkeypatch.setattr(main.whoop, "fetch_current", mock_fetch)
 
     main.wait_for_wake()
 
     mock_deliver.assert_not_called()
     mock_wait_net.assert_not_called()
     mock_fetch.assert_not_called()
+
+
+def test_wait_for_wake_polls_the_current_cycle_not_the_completed_one(monkeypatch):
+    """The wake trigger keys on the cycle in progress.
+
+    The most recently completed cycle closes at bedtime and is scored while you
+    are still asleep, so polling whoop.fetch() would fire the briefing in the
+    middle of the night carrying the previous night's numbers.
+    """
+    fixed_now = datetime(2026, 7, 24, 7, 5, tzinfo=NY)
+    monkeypatch.setattr(main, "datetime", _FixedDatetime(fixed_now))
+    monkeypatch.setattr(main.db, "brief_exists", MagicMock(return_value=False))
+    monkeypatch.setattr(main, "_wait_for_network", MagicMock(return_value=0.0))
+    monkeypatch.setattr(main, "_deliver", MagicMock())
+    monkeypatch.setattr(main.time, "sleep", MagicMock())
+    mock_completed = MagicMock(return_value=[{"sleep_hours": 7.0}])
+    monkeypatch.setattr(main.whoop, "fetch", mock_completed)
+    monkeypatch.setattr(
+        main.whoop, "fetch_current", MagicMock(return_value=[{"sleep_hours": 7.5}])
+    )
+
+    main.wait_for_wake()
+
+    mock_completed.assert_not_called()
 
 
 def test_wait_for_wake_delivers_immediately_on_completed_main_sleep(monkeypatch):
@@ -142,7 +166,7 @@ def test_wait_for_wake_delivers_immediately_on_completed_main_sleep(monkeypatch)
     monkeypatch.setattr(main, "_deliver", mock_deliver)
     mock_sleep = MagicMock()
     monkeypatch.setattr(main.time, "sleep", mock_sleep)
-    monkeypatch.setattr(main.whoop, "fetch", MagicMock(return_value=[{"sleep_hours": 7.0}]))
+    monkeypatch.setattr(main.whoop, "fetch_current", MagicMock(return_value=[{"sleep_hours": 7.0}]))
 
     main.wait_for_wake()
 
@@ -165,7 +189,7 @@ def test_wait_for_wake_naps_then_delivers_on_later_main_sleep(monkeypatch):
         [{"sleep_hours": 1.0}],  # nap: does not deliver
         [{"sleep_hours": 7.0}],  # real main sleep: delivers
     ])
-    monkeypatch.setattr(main.whoop, "fetch", mock_fetch)
+    monkeypatch.setattr(main.whoop, "fetch_current", mock_fetch)
 
     main.wait_for_wake()
 
@@ -184,7 +208,7 @@ def test_wait_for_wake_auth_failure_delivers_once_with_note_no_retry(monkeypatch
     mock_sleep = MagicMock()
     monkeypatch.setattr(main.time, "sleep", mock_sleep)
     monkeypatch.setattr(
-        main.whoop, "fetch", MagicMock(side_effect=main.whoop.WhoopAuthError("dead token"))
+        main.whoop, "fetch_current", MagicMock(side_effect=main.whoop.WhoopAuthError("dead token"))
     )
 
     main.wait_for_wake()
@@ -206,12 +230,12 @@ def test_wait_for_wake_past_cutoff_with_no_completed_cycle_delivers_with_note(mo
     monkeypatch.setattr(main, "_deliver", mock_deliver)
     mock_sleep = MagicMock()
     monkeypatch.setattr(main.time, "sleep", mock_sleep)
-    monkeypatch.setattr(main.whoop, "fetch", MagicMock(return_value=[]))
+    monkeypatch.setattr(main.whoop, "fetch_current", MagicMock(return_value=[]))
 
     main.wait_for_wake()
 
     mock_deliver.assert_called_once_with(
-        note=f"No completed sleep cycle found by {main.CUTOFF_HOUR}:00, sending without recovery."
+        note=f"No scored sleep from last night by {main.CUTOFF_HOUR}:00, sending without recovery."
     )
     mock_sleep.assert_not_called()
 
@@ -234,6 +258,7 @@ def test_whoop_audit_prints_table_and_returns_zero(monkeypatch, capsys):
             "recovery_score": 60,
             "sleep_hours": 8.0,
             "sleep_performance": 90,
+            "briefing_role": "completed",
             "workouts": [{"sport": "volleyball", "duration_min": 90, "strain": 12.0}],
         },
         {
@@ -245,6 +270,7 @@ def test_whoop_audit_prints_table_and_returns_zero(monkeypatch, capsys):
             "recovery_score": 70,
             "sleep_hours": 7.0,
             "sleep_performance": 85,
+            "briefing_role": "current",
             "workouts": [],
         },
     ]
@@ -258,6 +284,56 @@ def test_whoop_audit_prints_table_and_returns_zero(monkeypatch, capsys):
     assert "strain 10.0" in out and "recovery 60" in out and "sleep 8.0h" in out
     assert "volleyball" in out and "strain 12.0" in out
     assert "(no workouts)" in out
+
+
+def test_whoop_audit_prints_the_briefing_field_mapping_per_cycle(monkeypatch, capsys):
+    """One line per cycle naming which briefing fields come from it.
+
+    This is the check that the current/completed split is wired the way it is
+    documented, without sending a message and reading it on the phone.
+    """
+    rows = [
+        {
+            "date": "2026-07-24", "cycle_id": "open", "start_local": "2026-07-24 01:24",
+            "end_local": "-", "strain": None, "recovery_score": 79, "sleep_hours": 7.5,
+            "sleep_performance": 79, "briefing_role": "current", "workouts": [],
+        },
+        {
+            "date": "2026-07-23", "cycle_id": "done", "start_local": "2026-07-23 01:09",
+            "end_local": "2026-07-24 01:24", "strain": 14.2, "recovery_score": 41,
+            "sleep_hours": 5.0, "sleep_performance": 60, "briefing_role": "completed",
+            "workouts": [],
+        },
+        {
+            "date": "2026-07-22", "cycle_id": "older", "start_local": "2026-07-22 00:30",
+            "end_local": "2026-07-23 01:09", "strain": 9.0, "recovery_score": 55,
+            "sleep_hours": 6.0, "sleep_performance": 70, "briefing_role": None,
+            "workouts": [],
+        },
+    ]
+    monkeypatch.setattr(main.whoop, "audit", MagicMock(return_value=rows))
+
+    assert main.whoop_audit() == 0
+    lines = capsys.readouterr().out.splitlines()
+
+    briefing = [line.strip() for line in lines if line.strip().startswith("briefing:")]
+    assert len(briefing) == 3
+    assert "recovery, sleep, HRV, RHR" in briefing[0] and "header" in briefing[0]
+    assert "strain" in briefing[1] and "TRAINING" in briefing[1]
+    assert briefing[2] == "briefing: not used"
+
+
+def test_whoop_audit_row_without_a_briefing_role_key_still_prints(monkeypatch, capsys):
+    """A row from an older audit shape must not take the table down."""
+    rows = [{
+        "date": "2026-07-23", "cycle_id": "c1", "start_local": "2026-07-22 19:00",
+        "end_local": "2026-07-23 09:00", "strain": 10.0, "recovery_score": 60,
+        "sleep_hours": 8.0, "sleep_performance": 90, "workouts": [],
+    }]
+    monkeypatch.setattr(main.whoop, "audit", MagicMock(return_value=rows))
+
+    assert main.whoop_audit() == 0
+    assert "briefing: not used" in capsys.readouterr().out
 
 
 def test_whoop_audit_empty_rows_prints_message_and_returns_zero(monkeypatch, capsys):
