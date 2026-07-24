@@ -39,7 +39,7 @@ them so I can look them up.
 ## What this is
 
 athlete15 is a self-hosted personal assistant. Pulls data from several sources,
-stores it in local SQLite, and sends a briefing to Telegram around 6:30 AM daily.
+stores it in local SQLite, and sends a briefing to Telegram around 7:00 AM daily.
 Accepts commands back over Telegram to log training and injuries, and eventually to
 write to Notion and my calendar.
 
@@ -188,3 +188,10 @@ Phase 2: Telegram delivery. Weather and news sources are done and working.
 
 Do not build ahead. Stubs for later phases exist so the structure is visible, not so
 they get filled in early.
+
+
+## Future
+
+- Trigger the briefing on WHOOP wake detection rather than a fixed 7 AM.
+  Either recovery.updated webhook via a tunnel, or poll every 15 min from
+  6 AM until the cycle closes. Decide after phase 5.

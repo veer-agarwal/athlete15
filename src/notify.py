@@ -22,7 +22,7 @@ API_BASE = "https://api.telegram.org/bot"
 
 # Telegram rejects any message body over 4096 UTF-16 code units. The briefing will
 # grow past that once WHOOP, Notion, and news are all in, so split rather than let
-# a long message fail with a 400 at 6:30 AM.
+# a long message fail with a 400 at 7:00 AM.
 MAX_MESSAGE_CHARS = 4096
 
 

@@ -5,7 +5,7 @@ Capped at config.NEWS_MAX_ITEMS across all feeds in config.NEWS_FEEDS.
 
 feedparser does not raise on a dead or malformed feed. It sets parsed.bozo and
 returns zero entries, which means a broken feed looks like success. This runs
-unattended at 6:30 AM, so that failure must be surfaced, not swallowed.
+unattended at 7:00 AM, so that failure must be surfaced, not swallowed.
 """
 
 import calendar

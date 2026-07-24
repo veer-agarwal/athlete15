@@ -14,7 +14,7 @@ OAuth 2.0 authorization code flow:
 Two traps specific to WHOOP:
 
     - Recovery data does not exist until the preceding sleep cycle closes. If the
-      6:30 AM job runs before you wake up, you get nothing for that day. Handle the
+      7:00 AM job runs before you wake up, you get nothing for that day. Handle the
       empty case rather than crashing, and consider scheduling around your actual
       wake time.
     - The API is on v2. Endpoints are /v2/activity/sleep, /v2/activity/workout, and

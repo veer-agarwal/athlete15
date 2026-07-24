@@ -3,6 +3,7 @@
 .env
 *.token
 tokens.json
+brief.log
 
 # Database
 *.db

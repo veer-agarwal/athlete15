@@ -5,7 +5,7 @@ should ever call a hosted model.
 
 The briefing task is summarization over about twenty lines of structured facts.
 That is well within an 8B model at Q4 on an 8GB card, and nothing is waiting on
-tokens at 6:30 AM, so throughput barely matters here.
+tokens at 7:00 AM, so throughput barely matters here.
 
 Keep the system prompt strict. Small models drift into advice and filler unless
 told not to.

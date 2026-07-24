@@ -30,8 +30,8 @@ BACKUP_DIR = Path(os.getenv("BACKUP_DIR")) if os.getenv("BACKUP_DIR") else None
 # --- Telegram (phase 2) ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-BRIEF_HOUR = int(os.getenv("BRIEF_HOUR", "6"))
-BRIEF_MINUTE = int(os.getenv("BRIEF_MINUTE", "30"))
+BRIEF_HOUR = int(os.getenv("BRIEF_HOUR", "7"))
+BRIEF_MINUTE = int(os.getenv("BRIEF_MINUTE", "0"))
 
 # --- WHOOP (phase 5) ---
 WHOOP_CLIENT_ID = os.getenv("WHOOP_CLIENT_ID", "")
@@ -52,7 +52,8 @@ ATHLETICS_ICS_URL = os.getenv("ATHLETICS_ICS_URL", "")
 
 # --- News (phase 1) ---
 NEWS_FEEDS = [
-    "https://feeds.arstechnica.com/arstechnica/technology-lab",
+    "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml",
     "https://www.theverge.com/rss/index.xml",
+    "https://www.latent.space/feed",
 ]
 NEWS_MAX_ITEMS = 5
