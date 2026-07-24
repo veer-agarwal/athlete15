@@ -14,9 +14,19 @@ SECURITY: check that the incoming chat id matches TELEGRAM_CHAT_ID before acting
 any command. Anyone who finds your bot username can message it.
 """
 
-import requests
+import logging
 
-from src import config
+import requests
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from src import config, db, training
 
 API_BASE = "https://api.telegram.org/bot"
 
@@ -102,17 +112,157 @@ def send(text: str) -> None:
             )
 
 
-def run_bot() -> None:
-    """Start polling for incoming commands. Blocks.
+HELP_TEXT = (
+    "athlete15\n"
+    "\n"
+    "Send plain text to log. No command to remember:\n"
+    "  right shoulder 3\n"
+    "  court 90 rpe 6\n"
+    "  lifted 60 min rpe 8\n"
+    "  tweaked my left ankle\n"
+    "  right shoulder resolved\n"
+    "\n"
+    "Everything you send is stored word for word before it is parsed, so a\n"
+    "misread never loses the entry. The reply says what was understood.\n"
+    "\n"
+    "/status  active injuries and current load\n"
+    "/help    this message"
+)
 
-    Handlers to register (phase 4):
-        /lift /court /cond /mob   log a training session
-        /pain                     daily injury check-in
-        /injury                   open or resolve an injury
-        /brief                    send the briefing on demand
-        /status                   what the assistant currently knows
+
+def _is_authorized(update: Update) -> bool:
+    """Whether an update came from the configured chat.
+
+    Anyone who guesses the bot username can message it, and the bot writes to the
+    database, so this is checked on every handler rather than once at startup.
+    Rejections are logged rather than silently dropped: an unexpected chat id
+    showing up is worth being able to see.
     """
-    raise NotImplementedError("phase 2")
+    chat = update.effective_chat
+    if chat is None:
+        return False
+    if str(chat.id) != str(config.TELEGRAM_CHAT_ID):
+        logging.warning("rejected update from chat id %s", chat.id)
+        return False
+    return True
+
+
+async def _on_text(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Any non-command text is a log entry.
+
+    Order matters and is the whole point of this handler: the raw text goes to
+    disk first, then parsing runs, then the parse result is attached to the row
+    that already exists. A crash or a parser bug anywhere after the first write
+    costs you a parse, never the entry.
+
+    The database calls are synchronous inside an async handler. They are local
+    SQLite writes on the order of a millisecond, so blocking the event loop for
+    that long is not worth the complexity of a thread pool. Revisit if a handler
+    ever does real network work.
+    """
+    if not _is_authorized(update):
+        return
+
+    message = update.effective_message
+    if message is None or not message.text:
+        return
+
+    entry_id = db.insert_log_entry(message.text)
+    logging.info("log entry #%d received, %d chars", entry_id, len(message.text))
+
+    try:
+        result = training.parse_entry(message.text)
+        applied = training.apply_entry(result)
+        db.record_parse(
+            entry_id, result, result["parse_status"], result["parse_method"]
+        )
+        reply = training.format_parse_reply(result, applied, entry_id)
+    except Exception:
+        # The entry is already safe on disk. Mark it so a later re-parse can find
+        # it, tell the truth in the reply, and do not raise: an exception escaping
+        # here would be swallowed by PTB and look like the bot ignoring you.
+        logging.exception("parsing entry #%d failed", entry_id)
+        db.record_parse(entry_id, None, "error", training.DEFAULT_PARSE_METHOD)
+        reply = (
+            f"saved entry #{entry_id} but parsing it failed.\n"
+            "the raw text is stored and nothing was lost."
+        )
+
+    await message.reply_text(reply)
+
+
+async def _on_status(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Current training load and open injuries, on demand."""
+    if not _is_authorized(update):
+        return
+    await update.effective_message.reply_text(training.format_training_block())
+
+
+async def _on_help(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        return
+    await update.effective_message.reply_text(HELP_TEXT)
+
+
+async def _on_unknown_command(
+    update: Update, _context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Catch slash commands that are not registered.
+
+    Without this, a mistyped command is silently dropped. Worse, it is NOT stored
+    as a log entry (commands never are), so "/court 90 rpe 6" typed out of habit
+    from the old command grammar would vanish entirely. Say so explicitly.
+    """
+    if not _is_authorized(update):
+        return
+    await update.effective_message.reply_text(
+        "unknown command, and commands are not logged.\n"
+        "send it again without the slash to log it. /help for examples"
+    )
+
+
+def run_bot() -> None:
+    """Start polling for incoming messages. Blocks.
+
+    Polling rather than a webhook because this runs behind dorm NAT with no port
+    forwarding and no public hostname.
+
+    Raises:
+        RuntimeError: if the token or chat id is missing. Starting without the
+            chat id would leave the authorization check comparing against an
+            empty string and rejecting everything, which looks like a dead bot.
+    """
+    if not config.TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in .env")
+    if not config.TELEGRAM_CHAT_ID:
+        raise RuntimeError("TELEGRAM_CHAT_ID is not set in .env")
+
+    # python-telegram-bot talks over httpx, which logs every request URL at INFO.
+    # Telegram puts the bot token in the URL path, so leaving this on writes the
+    # token into brief.log on every poll, forever. Anyone with that token owns
+    # the bot. Warnings and errors still come through.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler(["start", "help"], _on_help))
+    app.add_handler(CommandHandler("status", _on_status))
+    # Text first, then the catch-all for commands. PTB dispatches to the first
+    # matching handler in a group, so the unknown-command fallback has to be
+    # registered after the real commands or it would shadow them.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
+    app.add_handler(MessageHandler(filters.COMMAND, _on_unknown_command))
+
+    logging.info("bot polling, authorized chat %s", config.TELEGRAM_CHAT_ID)
+
+    # Pending updates are deliberately NOT dropped. This machine sleeps, and a
+    # session logged at 9 PM with the lid shut sits queued on Telegram's side
+    # until polling resumes. Those are precisely the entries worth having, and
+    # discarding them would defeat the point of storing raw text at all.
+    # Duplicates are not the risk they look like: Telegram advances the update
+    # offset only once an update is acknowledged, so a normal restart does not
+    # replay anything already handled.
+    app.run_polling(allowed_updates=[Update.MESSAGE])
 
 
 if __name__ == "__main__":

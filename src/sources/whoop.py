@@ -390,6 +390,80 @@ def _sleep_for(client: WhoopClient, cycle: dict, recovery: dict) -> dict | None:
     return _scored(_get_or_none(client.get_sleep_for_cycle, cycle["id"]))
 
 
+def fetch_workouts(start_date: str | None = None) -> list[dict]:
+    """Workouts from the v2 workout endpoint, newest first.
+
+    These are WHOOP's own recorded activities and are never entered by hand. They
+    are deliberately kept apart from the `sessions` table, which holds what you
+    type into Telegram: a lift WHOOP saw as 48 minutes of elevated heart rate and
+    the same lift you logged as "60 min rpe 8" are two different measurements of
+    one event, and collapsing them would destroy the ability to compare them.
+
+    sport_id is left as WHOOP's integer. The name mapping is a separate lookup
+    that changes on WHOOP's schedule, not ours, and the raw payload keeps it
+    recoverable either way.
+
+    Args:
+        start_date: 'YYYY-MM-DD'. Defaults to the endpoint's own trailing
+            seven-day window.
+
+    Raises:
+        RuntimeError: if no token has been stored yet.
+        requests.HTTPError: for any API failure.
+    """
+    client = _authorized_client()
+    try:
+        workouts = client.get_workout_collection(start_date=start_date)
+    finally:
+        client.close()
+
+    rows = []
+    for workout in workouts:
+        # Unscored workouts still have start, end and sport. Keep them: an
+        # activity that happened is worth recording even before WHOOP finishes
+        # putting a strain number on it.
+        score = workout.get("score") or {}
+        rows.append({
+            "id": workout["id"],
+            "date": _local_date(workout["start"], workout.get("timezone_offset")),
+            "sport_id": workout.get("sport_id"),
+            "start_utc": workout["start"],
+            "end_utc": workout.get("end"),
+            "duration_min": _duration_min(workout.get("start"), workout.get("end")),
+            "strain": score.get("strain"),
+            "average_hr": score.get("average_heart_rate"),
+            "max_hr": score.get("max_heart_rate"),
+            "kilojoule": score.get("kilojoule"),
+            "scored": workout.get("score_state") == "SCORED",
+            "raw": workout,
+        })
+
+    logging.info("whoop: %d workout(s) from %s", len(rows), start_date or "last 7 days")
+    return rows
+
+
+def store_workouts(workouts: list[dict]) -> int:
+    """Write fetched workouts into whoop_workouts. Returns the number stored.
+
+    Kept out of fetch_workouts() so the source contract holds: modules under
+    sources/ return data and do not touch the database. Keyed on WHOOP's UUID, so
+    calling this on overlapping windows updates rows instead of duplicating them.
+    """
+    for workout in workouts:
+        db.upsert_whoop_workout(workout)
+    logging.info("whoop: %d workout(s) stored", len(workouts))
+    return len(workouts)
+
+
+def _duration_min(start: str | None, end: str | None) -> int | None:
+    """Whole minutes between two WHOOP timestamps, or None if either is missing."""
+    if not start or not end:
+        return None
+    started = datetime.fromisoformat(start.replace("Z", "+00:00"))
+    ended = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    return round((ended - started).total_seconds() / 60)
+
+
 def format_lines(metrics: dict) -> list[str]:
     """Recovery and sleep numbers for the briefing.
 

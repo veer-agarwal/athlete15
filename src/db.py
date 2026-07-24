@@ -34,6 +34,28 @@ CREATE TABLE IF NOT EXISTS daily_metrics (
     fetched_at        TEXT NOT NULL
 );
 
+-- WHOOP's own recorded activities. Deliberately NOT the sessions table below:
+-- these are measured by the strap and never hand entered, and the lift WHOOP saw
+-- as 48 minutes of elevated heart rate is a different measurement from the same
+-- lift you logged as "60 min rpe 8". Keeping both lets you compare them; merging
+-- them would silently destroy that.
+CREATE TABLE IF NOT EXISTS whoop_workouts (
+    id           TEXT PRIMARY KEY,       -- WHOOP v2 workout UUID
+    date         TEXT NOT NULL,          -- local date the workout started
+    sport_id     INTEGER,                -- WHOOP's integer, not a name
+    start_utc    TEXT NOT NULL,
+    end_utc      TEXT,
+    duration_min INTEGER,
+    strain       REAL,
+    average_hr   INTEGER,
+    max_hr       INTEGER,
+    kilojoule    REAL,
+    raw_json     TEXT,
+    fetched_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_whoop_workouts_date ON whoop_workouts(date);
+
 -- ---------- training ----------
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -110,6 +132,23 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_utc);
+
+-- ---------- inbound log ----------
+
+-- Every message sent to the bot, stored verbatim before anything tries to
+-- interpret it. Parsing is lossy and the parser will be replaced (simple regex
+-- now, possibly a local model later), so raw_text is the record of truth and the
+-- parsed columns are a derived cache that can be recomputed from it.
+CREATE TABLE IF NOT EXISTS log_entries (
+    id           INTEGER PRIMARY KEY,
+    received_at  TEXT NOT NULL,          -- UTC ISO-8601
+    raw_text     TEXT NOT NULL,          -- exactly as sent, never edited
+    parsed_json  TEXT,                   -- parse_entry() output, NULL until parsed
+    parse_status TEXT,                   -- parsed | partial | unparsed | error
+    parse_method TEXT                    -- simple | llm
+);
+
+CREATE INDEX IF NOT EXISTS idx_log_entries_received ON log_entries(received_at);
 
 -- ---------- output log ----------
 
@@ -260,6 +299,117 @@ def upsert_daily_metrics(row: dict, path: Path | None = None) -> None:
     try:
         with conn:
             conn.execute(_UPSERT_DAILY_METRICS, params)
+    finally:
+        conn.close()
+
+
+_WORKOUT_COLUMNS = (
+    "date",
+    "sport_id",
+    "start_utc",
+    "end_utc",
+    "duration_min",
+    "strain",
+    "average_hr",
+    "max_hr",
+    "kilojoule",
+)
+
+_UPSERT_WORKOUT = f"""
+INSERT INTO whoop_workouts (id, {", ".join(_WORKOUT_COLUMNS)}, raw_json, fetched_at)
+VALUES (:id, {", ".join(f":{c}" for c in _WORKOUT_COLUMNS)}, :raw_json, :fetched_at)
+ON CONFLICT(id) DO UPDATE SET
+    {", ".join(f"{c} = excluded.{c}" for c in (*_WORKOUT_COLUMNS, "raw_json"))},
+    fetched_at = excluded.fetched_at
+"""
+
+
+def upsert_whoop_workout(row: dict, path: Path | None = None) -> None:
+    """Insert or update one WHOOP workout, keyed on WHOOP's UUID.
+
+    Overwrites rather than COALESCEs, unlike upsert_daily_metrics. A workout is
+    re-fetched constantly because the collection endpoint defaults to a trailing
+    seven day window, and WHOOP revises a workout's strain after the fact once
+    late heart rate samples sync. The newest version from WHOOP is always the one
+    to keep.
+
+    Raises:
+        ValueError: if 'id' is missing.
+    """
+    if not row.get("id"):
+        raise ValueError("workout row needs an 'id'")
+
+    raw_json = row.get("raw_json")
+    if raw_json is None and row.get("raw") is not None:
+        raw_json = json.dumps(row["raw"], default=str)
+
+    params = {
+        "id": row["id"],
+        "raw_json": raw_json,
+        "fetched_at": row.get("fetched_at") or datetime.now(timezone.utc).isoformat(),
+        **{column: row.get(column) for column in _WORKOUT_COLUMNS},
+    }
+
+    conn = connect(path)
+    try:
+        with conn:
+            conn.execute(_UPSERT_WORKOUT, params)
+    finally:
+        conn.close()
+
+
+def insert_log_entry(
+    raw_text: str,
+    received_at: str | None = None,
+    path: Path | None = None,
+) -> int:
+    """Store an inbound message verbatim and return its id.
+
+    Called before the parser runs, on purpose. The parser is the part most likely
+    to be wrong or to change, and a session typed out on a phone at the end of a
+    lift exists nowhere else. Getting the text onto disk first means the worst a
+    parser bug can do is leave parsed_json NULL, never lose the entry.
+    """
+    conn = connect(path)
+    try:
+        with conn:
+            cursor = conn.execute(
+                "INSERT INTO log_entries (received_at, raw_text) VALUES (?, ?)",
+                (received_at or datetime.now(timezone.utc).isoformat(), raw_text),
+            )
+            return int(cursor.lastrowid)
+    finally:
+        conn.close()
+
+
+def record_parse(
+    entry_id: int,
+    parsed: dict | None,
+    parse_status: str,
+    parse_method: str,
+    path: Path | None = None,
+) -> None:
+    """Attach a parse result to an already stored log entry.
+
+    Separate from insert_log_entry so re-parsing history later (with a better
+    parser) is an UPDATE over existing rows rather than a migration.
+    """
+    conn = connect(path)
+    try:
+        with conn:
+            conn.execute(
+                """
+                UPDATE log_entries
+                   SET parsed_json = ?, parse_status = ?, parse_method = ?
+                 WHERE id = ?
+                """,
+                (
+                    json.dumps(parsed, default=str) if parsed is not None else None,
+                    parse_status,
+                    parse_method,
+                    entry_id,
+                ),
+            )
     finally:
         conn.close()
 

@@ -103,6 +103,11 @@ def main() -> None:
         action="store_true",
         help="run the one-time WHOOP browser authorization and store the token",
     )
+    parser.add_argument(
+        "--bot",
+        action="store_true",
+        help="start Telegram polling for log entries and block",
+    )
     args = parser.parse_args()
 
     _configure_logging()
@@ -114,6 +119,15 @@ def main() -> None:
 
     db.init_db()
     logging.info("database ready at %s", config.DB_PATH)
+
+    if args.bot:
+        # Polling only, no scheduler. The eventual shape is both in one process
+        # (BackgroundScheduler alongside the bot, per the note at the bottom of
+        # this file), but PTB owns the main thread's event loop and merging the
+        # two is its own change. Run --bot and the scheduled --now task side by
+        # side until then.
+        notify.run_bot()
+        return
 
     if args.now:
         logging.info("manual run (--now)")

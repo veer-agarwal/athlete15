@@ -201,3 +201,12 @@ they get filled in early.
   from 6 AM until the sleep cycle closes. Webhooks are the alternative but
   need a tunnel (Tailscale Funnel) and a machine that is awake to receive.
   Decide after phase 5 is stable.
+
+- Get Myfitnesspal and GE FITPROFILE data from either that or apple health
+
+- maybe setup agentic trading through robinhood with a small test ammount of money
+
+-The assistant surfaces patterns and asks questions. It does not prescribe
+training decisions and never advises on whether to train through pain or
+injury. Injury-related output is limited to reporting logged values and
+their trend.
