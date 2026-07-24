@@ -136,6 +136,24 @@ src/
     athletics.py   .ics parsing (phase 8)
 save.ps1           git add + commit + push
 ```
+## Subagents
+
+Defined in .claude/agents/. Delegate to them rather than doing their work inline.
+
+- **reviewer** (opus, read-only) - run on the diff before every commit. Not
+  optional. This is the main check on code I did not write myself.
+- **debugger** (opus, read-only) - any failure, traceback, or missing 7 AM
+  briefing. Diagnose before proposing a fix.
+- **tester** (sonnet) - after any parser, calculation, or data transformation.
+  Writes tests/ only, never source.
+- **source-builder** (sonnet) - new or modified modules in src/sources/.
+
+Do not delegate single-line edits, config changes, or anything under about
+20 lines. Subagent overhead exceeds the benefit and each one carries its own
+context window.
+
+After completing any implementation task, invoke reviewer before telling me it
+is done. Report what it found, including when it found nothing.
 
 ### Source module contract
 
