@@ -48,6 +48,11 @@ WHOOP_TOKEN_PATH = ROOT / "whoop_token.json"
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
 NOTION_TASKS_DB_ID = os.getenv("NOTION_TASKS_DB_ID", "")
 
+# Page the coursework database gets created under, used only by
+# scripts/create_notion_db.py. A database has to live inside a page; there is no
+# workspace root to create one in via the API.
+NOTION_PARENT_PAGE_ID = os.getenv("NOTION_PARENT_PAGE_ID", "")
+
 # --- Ollama (phase 7) ---
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.3:8b")

@@ -1,5 +1,5 @@
 # Secrets — NEVER commit
-.claude/
+.claude/worktrees/
 .env
 *.token
 tokens.json
