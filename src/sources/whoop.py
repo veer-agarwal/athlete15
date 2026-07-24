@@ -30,6 +30,7 @@ Then pull history with:              python -m src.sources.whoop backfill 2024-0
 
 import json
 import logging
+import shutil
 import sys
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
@@ -37,12 +38,24 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import requests
+from authlib.integrations.base_client.errors import OAuthError
 from whoop import WhoopClient
 
 from src import config, db
 
 AUTH_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
 TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
+
+
+class WhoopAuthError(RuntimeError):
+    """A refresh or access token WHOOP rejected, distinct from a network fault.
+
+    Raised when the OAuth grant itself failed (invalid_grant / invalid_request),
+    which replaying cannot fix: the refresh token was consumed or revoked, and
+    the only cure is re-running the browser authorization. Callers must treat
+    this as fatal and NOT retry, unlike a requests.RequestException, which is a
+    transient network condition worth retrying.
+    """
 
 SCOPES = [
     "read:recovery",
@@ -60,10 +73,14 @@ SCOPES = [
 # morning briefing's.
 FETCH_LOOKBACK_DAYS = 3
 
-# authlib leaves its requests untimed. Same reasoning as the timeout in weather.py:
-# this is a single process, so one hung socket stalls the whole morning job with no
-# upper bound.
-REQUEST_TIMEOUT_SECONDS = 15
+# (connect, read) rather than one scalar. The read leg is generous because the
+# real failure this fixes was a token refresh whose response arrived just after a
+# 15s cap on a cold connection right after S3 wake: WHOOP had already rotated the
+# refresh token server-side, so timing out before reading the response threw away
+# the new token and locked out every call after. 45s lets that response land. The
+# connect leg stays short so a genuinely dead adapter fails fast. default_timeout
+# applies this to EVERY session request, including authlib's token refresh.
+REQUEST_TIMEOUT = (10, 45)
 
 # The `state` value from the most recent build_authorize_url() call in this process.
 # See exchange_code() for why it is a module global rather than an argument.
@@ -93,13 +110,30 @@ def _save_token(token: dict) -> None:
     Written to a temp file and renamed rather than truncating in place. A partial
     write here is not a lost line of data, it is being locked out of the API until
     the browser step is repeated.
+
+    Registered as authlib's update_token callback (via the whoop library's
+    on_token_refresh, see _get_client), so a rotated token hits disk the instant
+    the session issues it, before the API call that triggered the refresh
+    proceeds, rather than only after a call succeeds.
+
+    The previous file is kept as .bak, written atomically (copy to .bak.tmp then
+    replace) so the backup itself is never a half-written file. Its value is
+    narrow but real: it recovers a corrupted or truncated write of the live file.
+    It does NOT reliably let you "go back a rotation" once a refresh has
+    succeeded, because WHOOP invalidates the old refresh token the moment it
+    issues a new one, so .bak's refresh token is usually already dead server-side.
     """
-    temp_path = config.WHOOP_TOKEN_PATH.with_name(config.WHOOP_TOKEN_PATH.name + ".tmp")
+    target = config.WHOOP_TOKEN_PATH
+    temp_path = target.with_name(target.name + ".tmp")
     # dict() because authlib hands back an OAuth2Token, which json.dumps will only
     # serialize by accident of it subclassing dict.
     temp_path.write_text(json.dumps(dict(token), indent=2), encoding="utf-8")
-    temp_path.replace(config.WHOOP_TOKEN_PATH)
-    logging.info("whoop token written to %s", config.WHOOP_TOKEN_PATH)
+    if target.exists():
+        bak_temp = target.with_name(target.name + ".bak.tmp")
+        shutil.copyfile(target, bak_temp)
+        bak_temp.replace(target.with_name(target.name + ".bak"))
+    temp_path.replace(target)  # atomic within the same directory
+    logging.info("whoop token written to %s", target)
 
 
 def _get_client(token: dict | None = None) -> WhoopClient:
@@ -118,7 +152,7 @@ def _get_client(token: dict | None = None) -> WhoopClient:
         token=token,
         on_token_refresh=_save_token,
     )
-    client.session.default_timeout = REQUEST_TIMEOUT_SECONDS
+    client.session.default_timeout = REQUEST_TIMEOUT
     return client
 
 
@@ -213,13 +247,13 @@ def refresh_access_token() -> dict:
 # parsing
 
 
-def _local_date(timestamp: str, offset: str | None) -> str:
-    """Local calendar date of a WHOOP timestamp as 'YYYY-MM-DD'.
+def _to_local(timestamp: str, offset: str | None) -> datetime:
+    """A WHOOP timestamp as an aware datetime in the record's own local zone.
 
     Uses the UTC offset WHOOP recorded for the record ('-05:00') rather than
     assuming America/New_York, so a road trip to a match in a different zone still
-    files the day correctly. Falls back to the configured timezone if the offset is
-    missing or malformed.
+    lands in the right local wall-clock time. Falls back to the configured
+    timezone if the offset is missing or malformed.
     """
     moment = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
 
@@ -236,7 +270,23 @@ def _local_date(timestamp: str, offset: str | None) -> str:
                 config.TIMEZONE,
             )
 
-    return moment.astimezone(tzinfo).strftime("%Y-%m-%d")
+    return moment.astimezone(tzinfo)
+
+
+def _local_date(timestamp: str, offset: str | None) -> str:
+    """Local calendar date of a WHOOP timestamp as 'YYYY-MM-DD'."""
+    return _to_local(timestamp, offset).strftime("%Y-%m-%d")
+
+
+def _local_dt_str(timestamp: str | None, offset: str | None) -> str:
+    """Local 'YYYY-MM-DD HH:MM' for a WHOOP timestamp, or '-' when absent.
+
+    Used by the bucketing log and the audit table, where seeing the wall-clock
+    start and end next to the assigned date is the whole point of the diff.
+    """
+    if not timestamp:
+        return "-"
+    return _to_local(timestamp, offset).strftime("%Y-%m-%d %H:%M")
 
 
 def _metric_date(cycle: dict, sleep: dict | None) -> str:
@@ -326,6 +376,17 @@ def _get_or_none(call: Callable[..., dict], *args: Any) -> dict | None:
 # public source contract
 
 
+def _auth_failed(exc: OAuthError) -> WhoopAuthError:
+    """Log the one actionable line and wrap an OAuth rejection for the caller.
+
+    Kept as one helper so the exact remediation string is identical everywhere a
+    token gets rejected, and so callers can catch WhoopAuthError without importing
+    authlib.
+    """
+    logging.error("WHOOP auth failed, run: python -m src.main --auth")
+    return WhoopAuthError(f"WHOOP rejected the stored token: {exc}")
+
+
 def fetch() -> list[dict]:
     """Return the most recent complete day of recovery, sleep and strain.
 
@@ -339,6 +400,8 @@ def fetch() -> list[dict]:
 
     Raises:
         RuntimeError: if no token has been stored yet.
+        WhoopAuthError: if WHOOP rejected the token (dead refresh token). Fatal,
+            do not retry; the fix is re-running --auth.
         requests.HTTPError: for any API failure other than a 404 on a
             sub-resource that does not exist.
     """
@@ -362,7 +425,24 @@ def fetch() -> list[dict]:
                 logging.info("whoop: cycle %s has no scored sleep", cycle["id"])
                 continue
 
-            return [_row(cycle, recovery, sleep)]
+            row = _row(cycle, recovery, sleep)
+            # The date-bucketing audit trail. "Yesterday" in the briefing is this
+            # completed cycle, and this line records exactly how its local date was
+            # derived so a wrong bucket can be caught by reading brief.log against
+            # the WHOOP app rather than guessed at.
+            logging.info(
+                "whoop cycle %s: local start %s, end %s -> assigned date %s",
+                cycle.get("id"),
+                _local_dt_str(cycle.get("start"), cycle.get("timezone_offset")),
+                _local_dt_str(cycle.get("end"), cycle.get("timezone_offset")),
+                row["date"],
+            )
+            return [row]
+    except OAuthError as exc:
+        # The auto-refresh inside a data call failed at the grant level. This is
+        # never worth retrying: the refresh token was consumed or revoked, and
+        # every replay just re-fails. Fail fast and loud instead.
+        raise _auth_failed(exc) from exc
     finally:
         client.close()
 
@@ -399,9 +479,10 @@ def fetch_workouts(start_date: str | None = None) -> list[dict]:
     the same lift you logged as "60 min rpe 8" are two different measurements of
     one event, and collapsing them would destroy the ability to compare them.
 
-    sport_id is left as WHOOP's integer. The name mapping is a separate lookup
-    that changes on WHOOP's schedule, not ours, and the raw payload keeps it
-    recoverable either way.
+    sport_id is kept as WHOOP's integer, and sport_name as the label WHOOP puts
+    in the payload alongside it ('volleyball', 'weightlifting'). The name is taken
+    from the response rather than mapped from the id locally, so a WHOOP sport-id
+    reshuffle never silently mislabels an activity.
 
     Args:
         start_date: 'YYYY-MM-DD'. Defaults to the endpoint's own trailing
@@ -409,11 +490,14 @@ def fetch_workouts(start_date: str | None = None) -> list[dict]:
 
     Raises:
         RuntimeError: if no token has been stored yet.
+        WhoopAuthError: if WHOOP rejected the token. Fatal, do not retry.
         requests.HTTPError: for any API failure.
     """
     client = _authorized_client()
     try:
         workouts = client.get_workout_collection(start_date=start_date)
+    except OAuthError as exc:
+        raise _auth_failed(exc) from exc
     finally:
         client.close()
 
@@ -427,6 +511,7 @@ def fetch_workouts(start_date: str | None = None) -> list[dict]:
             "id": workout["id"],
             "date": _local_date(workout["start"], workout.get("timezone_offset")),
             "sport_id": workout.get("sport_id"),
+            "sport_name": workout.get("sport_name"),
             "start_utc": workout["start"],
             "end_utc": workout.get("end"),
             "duration_min": _duration_min(workout.get("start"), workout.get("end")),
@@ -462,6 +547,81 @@ def _duration_min(start: str | None, end: str | None) -> int | None:
     started = datetime.fromisoformat(start.replace("Z", "+00:00"))
     ended = datetime.fromisoformat(end.replace("Z", "+00:00"))
     return round((ended - started).total_seconds() / 60)
+
+
+def audit(days: int = 7) -> list[dict]:
+    """Per-cycle audit rows for the last `days` days, for diffing against the app.
+
+    Joins cycles with their recovery and sleep locally (one collection call each,
+    the same approach as backfill), attaches every workout to the cycle whose
+    assigned local date it falls on, and reports the cycle's own local start and
+    end. The point is to verify date bucketing by eye: if a workout or a day
+    strain lands under the wrong date here, it lands under the wrong date in the
+    briefing too. Newest cycle first. Unfinished cycles are included on purpose so
+    the current day shows too; day strain on those is still climbing.
+
+    Each row: date, cycle_id, start_local, end_local, strain, recovery_score,
+    sleep_hours, sleep_performance, workouts[{sport, duration_min, strain}].
+
+    Raises:
+        RuntimeError: if no token has been stored yet.
+        WhoopAuthError: if WHOOP rejected the token.
+    """
+    start = (date.today() - timedelta(days=days)).isoformat()
+
+    client = _authorized_client()
+    try:
+        cycles = client.get_cycle_collection(start_date=start)
+        recoveries = client.get_recovery_collection(start_date=start)
+        sleeps = client.get_sleep_collection(start_date=start)
+    except OAuthError as exc:
+        raise _auth_failed(exc) from exc
+    finally:
+        client.close()
+
+    # fetch_workouts manages its own client and already parses and labels rows.
+    workouts = fetch_workouts(start_date=start)
+
+    recovery_by_cycle = {r["cycle_id"]: r for r in recoveries if _scored(r)}
+    sleep_by_id = {s["id"]: s for s in sleeps if _scored(s)}
+
+    workouts_by_date: dict[str, list[dict]] = {}
+    for workout in workouts:
+        workouts_by_date.setdefault(workout["date"], []).append(workout)
+
+    rows = []
+    for cycle in cycles:
+        recovery = recovery_by_cycle.get(cycle["id"])
+        sleep = sleep_by_id.get(recovery.get("sleep_id")) if recovery else None
+        assigned = _metric_date(cycle, sleep)
+
+        recovery_score = (recovery or {}).get("score") or {}
+        sleep_score = (sleep or {}).get("score") or {}
+        cycle_score = cycle.get("score") or {}
+
+        rows.append({
+            "date": assigned,
+            "cycle_id": cycle.get("id"),
+            "start_local": _local_dt_str(cycle.get("start"), cycle.get("timezone_offset")),
+            "end_local": _local_dt_str(cycle.get("end"), cycle.get("timezone_offset")),
+            "strain": cycle_score.get("strain"),
+            "recovery_score": recovery_score.get("recovery_score"),
+            "sleep_hours": _sleep_hours(sleep),
+            "sleep_performance": sleep_score.get("sleep_performance_percentage"),
+            "workouts": [
+                {
+                    "sport": workout.get("sport_name") or f"sport {workout.get('sport_id')}",
+                    "duration_min": workout.get("duration_min"),
+                    "strain": workout.get("strain"),
+                }
+                for workout in sorted(
+                    workouts_by_date.get(assigned, []),
+                    key=lambda w: w.get("start_utc") or "",
+                )
+            ],
+        })
+
+    return rows
 
 
 def format_lines(metrics: dict) -> list[str]:
