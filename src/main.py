@@ -199,11 +199,22 @@ def wait_for_wake() -> None:
             # misdiagnosed timing problem before.
             logging.warning("WHOOP request failed (will retry): %s", exc)
         else:
-            if items and _is_main_sleep(items[0]):
-                logging.info("completed main-sleep cycle found, delivering briefing")
+            # The signal that I am awake and the strap has synced is the CURRENT
+            # (open) cycle appearing with a scored recovery and last night's
+            # sleep on it. Selected by cycle_kind, not by position: fetch() also
+            # returns the completed cycle, whose sleep is the night BEFORE last,
+            # and delivering on that would send a night-stale header.
+            current = next(
+                (row for row in items if row.get("cycle_kind") == "current"), None
+            )
+            if current is not None and _is_main_sleep(current):
+                logging.info(
+                    "current cycle %s has last night's main sleep, delivering briefing",
+                    current.get("cycle_id"),
+                )
                 _deliver()
                 return
-            logging.info("whoop: no completed main-sleep cycle yet")
+            logging.info("whoop: no current cycle with a scored main sleep yet")
 
         if datetime.now(tz) >= cutoff:
             logging.info(

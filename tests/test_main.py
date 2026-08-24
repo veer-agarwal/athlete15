@@ -142,7 +142,11 @@ def test_wait_for_wake_delivers_immediately_on_completed_main_sleep(monkeypatch)
     monkeypatch.setattr(main, "_deliver", mock_deliver)
     mock_sleep = MagicMock()
     monkeypatch.setattr(main.time, "sleep", mock_sleep)
-    monkeypatch.setattr(main.whoop, "fetch", MagicMock(return_value=[{"sleep_hours": 7.0}]))
+    monkeypatch.setattr(
+        main.whoop,
+        "fetch",
+        MagicMock(return_value=[{"cycle_kind": "current", "sleep_hours": 7.0}]),
+    )
 
     main.wait_for_wake()
 
@@ -162,8 +166,8 @@ def test_wait_for_wake_naps_then_delivers_on_later_main_sleep(monkeypatch):
     mock_sleep = MagicMock()
     monkeypatch.setattr(main.time, "sleep", mock_sleep)
     mock_fetch = MagicMock(side_effect=[
-        [{"sleep_hours": 1.0}],  # nap: does not deliver
-        [{"sleep_hours": 7.0}],  # real main sleep: delivers
+        [{"cycle_kind": "current", "sleep_hours": 1.0}],  # nap: does not deliver
+        [{"cycle_kind": "current", "sleep_hours": 7.0}],  # main sleep: delivers
     ])
     monkeypatch.setattr(main.whoop, "fetch", mock_fetch)
 

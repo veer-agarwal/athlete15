@@ -96,44 +96,47 @@ def test_session_desc_only_type():
 
 
 def test_metrics_line_full():
-    metrics = {
+    current = {
         "recovery_score": 54,
         "sleep_hours": 6.2,
         "sleep_performance": 71,
         "hrv_ms": 62,
         "resting_hr": 51,
     }
-    assert brief._metrics_line(metrics) == (
+    assert brief._metrics_line(current, None) == (
         "Recovery 54  |  Sleep 6h12m (71%)  |  HRV 62  |  RHR 51"
     )
 
 
 def test_metrics_line_missing_fields_are_omitted():
-    metrics = {"recovery_score": 54, "sleep_hours": None, "hrv_ms": None, "resting_hr": None}
-    assert brief._metrics_line(metrics) == "Recovery 54"
+    current = {"recovery_score": 54, "sleep_hours": None, "hrv_ms": None, "resting_hr": None}
+    assert brief._metrics_line(current, None) == "Recovery 54"
 
 
 def test_metrics_line_sleep_without_performance_has_no_parens():
-    metrics = {"recovery_score": None, "sleep_hours": 6.2, "sleep_performance": None,
+    current = {"recovery_score": None, "sleep_hours": 6.2, "sleep_performance": None,
                "hrv_ms": None, "resting_hr": None}
-    assert brief._metrics_line(metrics) == "Sleep 6h12m"
+    assert brief._metrics_line(current, None) == "Sleep 6h12m"
 
 
 def test_metrics_line_all_missing_is_empty():
-    metrics = {"recovery_score": None, "sleep_hours": None, "hrv_ms": None, "resting_hr": None}
-    assert brief._metrics_line(metrics) == ""
+    current = {"recovery_score": None, "sleep_hours": None, "hrv_ms": None, "resting_hr": None}
+    assert brief._metrics_line(current, None) == ""
 
 
 def test_metrics_line_empty_dict_is_empty():
-    assert brief._metrics_line({}) == ""
+    assert brief._metrics_line({}, {}) == ""
+
+
+def test_metrics_line_both_cycles_none_is_empty():
+    assert brief._metrics_line(None, None) == ""
 
 
 def test_metrics_line_with_strain_adds_second_exact_line():
-    metrics = {
+    current = {
         "recovery_score": 54, "sleep_hours": None, "hrv_ms": None, "resting_hr": None,
-        "strain": 14.6,
     }
-    result = brief._metrics_line(metrics)
+    result = brief._metrics_line(current, {"strain": 14.6})
     lines = result.split("\n")
     assert len(lines) == 2
     assert lines[0] == "Recovery 54"
@@ -141,19 +144,38 @@ def test_metrics_line_with_strain_adds_second_exact_line():
 
 
 def test_metrics_line_strain_none_omits_second_line():
-    metrics = {
+    current = {
         "recovery_score": 54, "sleep_hours": None, "hrv_ms": None, "resting_hr": None,
-        "strain": None,
     }
-    assert brief._metrics_line(metrics) == "Recovery 54"
+    assert brief._metrics_line(current, {"strain": None}) == "Recovery 54"
 
 
 def test_metrics_line_only_strain_present_no_recovery_line():
-    metrics = {
+    current = {
         "recovery_score": None, "sleep_hours": None, "hrv_ms": None, "resting_hr": None,
-        "strain": 9.2,
     }
-    assert brief._metrics_line(metrics) == "Yesterday's Strain 9.2"
+    assert brief._metrics_line(current, {"strain": 9.2}) == "Yesterday's Strain 9.2"
+
+
+def test_metrics_line_header_ignores_completed_cycle_values():
+    """Recovery, sleep, HRV and RHR must come off the CURRENT cycle only.
+    Reading them off the completed cycle is the night-stale bug this split
+    exists to fix, and a fallback would hide it whenever both are present."""
+    current = {"recovery_score": 54, "sleep_hours": 7.0, "sleep_performance": 90}
+    completed = {
+        "recovery_score": 31, "sleep_hours": 4.0, "sleep_performance": 40,
+        "hrv_ms": 20, "resting_hr": 70, "strain": 14.6,
+    }
+    lines = brief._metrics_line(current, completed).split("\n")
+    assert lines[0] == "Recovery 54  |  Sleep 7h00m (90%)"
+    assert lines[1] == "Yesterday's Strain 14.6"
+
+
+def test_metrics_line_strain_ignores_current_cycle_partial_strain():
+    """The open cycle's strain is still climbing, so it is not yesterday's
+    number and must never reach the message."""
+    current = {"recovery_score": 54, "strain": 3.1}
+    assert brief._metrics_line(current, None) == "Recovery 54"
 
 
 # --- _sleep_note -----------------------------------------------------------------
@@ -730,7 +752,7 @@ def test_today_block_event_without_location_has_no_dash_suffix(mock_fetch):
 # --- build() ---------------------------------------------------------------------
 
 
-@patch("src.brief._fetch_metrics", return_value=None)
+@patch("src.brief._fetch_metrics", return_value=(None, None))
 @patch("src.brief._news_block", return_value="NEWS\n  - headline one")
 @patch("src.brief._weather_block", return_value="72F, high 84, partly cloudy, 20% precip")
 @patch("src.brief._training_block", return_value="")
@@ -745,7 +767,7 @@ def test_build_joins_nonempty_blocks_with_blank_lines(
     )
 
 
-@patch("src.brief._fetch_metrics", return_value=None)
+@patch("src.brief._fetch_metrics", return_value=(None, None))
 @patch("src.brief._news_block", return_value="")
 @patch("src.brief._weather_block", return_value="")
 @patch("src.brief._training_block", return_value="")
